@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+id = "projectorplancut"
+version = "0.1.0"
+name = "Projector Plan/Elevation Cut"
+tagline = "Camera-based cuts and projection export (SVG/DXF) for any Mesh"
+maintainer = "Luiz <luiz@example.com>"
+type = "add-on"
+website = "https://example.com/projector-plan-elevation-cut"
+tags = [
+    "3D View",
+    "Camera",
+    "Import-Export",
+    "Mesh",
+    "Object"
+]
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+platforms = ["windows-x64", "linux-x64", "macos-x64", "macos-arm64"]
+permissions.files = "Export SVG and DXF files to disk"
