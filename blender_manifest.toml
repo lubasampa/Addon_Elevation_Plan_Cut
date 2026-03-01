@@ -1,11 +1,11 @@
 schema_version = "1.0.0"
-id = "projectorplancut"
-version = "0.1.0"
-name = "Projector Plan/Elevation Cut"
+id = "meshcutplanelevation"
+version = "0.1.1"
+name = "Mesh Cut Plan/Elevation"
 tagline = "Camera-based cuts and projection export (SVG/DXF) for any Mesh"
 maintainer = "Luiz <luiz@example.com>"
 type = "add-on"
-website = "https://example.com/projector-plan-elevation-cut"
+website = "https://example.com/meshcut-plan-elevation"
 tags = [
     "3D View",
     "Camera",
