@@ -138,10 +138,13 @@ def _resolve_export_context(context: bpy.types.Context):
 
 
 def _create_performance_budget(settings):
+    visible_only = bool(getattr(settings, "visible_only", True))
+    fallback_visible = bool(getattr(settings, "budget_fallback_visible", True))
     return {
         "enabled": bool(getattr(settings, "performance_guard", False)),
         "max_ray_casts": int(getattr(settings, "max_ray_casts", 200000)),
-        "fallback_visible": bool(getattr(settings, "budget_fallback_visible", True)),
+        # "Visible Only (No X-Ray)" must never degrade to x-ray when guard limit is reached.
+        "fallback_visible": fallback_visible and not visible_only,
         "ray_casts": 0,
         "limit_hit": False,
     }
@@ -154,13 +157,23 @@ def _is_world_point_visible(scene, depsgraph, camera, point_world: Vector, epsil
             return True if budget["fallback_visible"] else False
         budget["ray_casts"] += 1
 
-    origin = camera.matrix_world.translation
-    ray = point_world - origin
-    dist = ray.length
-    if dist <= epsilon:
-        return True
+    if camera.data.type == "ORTHO":
+        cam_inv = camera.matrix_world.inverted()
+        p_cam = cam_inv @ point_world
+        dist = -p_cam.z
+        if dist <= epsilon:
+            return True
 
-    direction = ray / dist
+        origin = camera.matrix_world @ Vector((p_cam.x, p_cam.y, 0.0))
+        direction = camera.matrix_world.to_quaternion() @ Vector((0.0, 0.0, -1.0))
+    else:
+        origin = camera.matrix_world.translation
+        ray = point_world - origin
+        dist = ray.length
+        if dist <= epsilon:
+            return True
+        direction = ray / dist
+
     hit, location, _normal, _index, _obj, _matrix = scene.ray_cast(depsgraph, origin, direction, distance=dist + epsilon)
     if not hit:
         return True
@@ -296,6 +309,57 @@ def _format_length(scene, length: float) -> str:
     return f"{length:.3f}"
 
 
+def _angle_radians(p1: Vector, pivot: Vector, p3: Vector):
+    v1 = p1 - pivot
+    v2 = p3 - pivot
+    if v1.length <= 1e-9 or v2.length <= 1e-9:
+        return None
+    c = max(-1.0, min(1.0, v1.normalized().dot(v2.normalized())))
+    return math.acos(c)
+
+
+def _format_angle(p1: Vector, pivot: Vector, p3: Vector) -> str:
+    angle = _angle_radians(p1, pivot, p3)
+    if angle is None:
+        return "0.00 deg"
+    return f"{math.degrees(angle):.2f} deg"
+
+
+def _angle_label_position(p1: Vector, pivot: Vector, p3: Vector) -> Vector:
+    v1 = p1 - pivot
+    v2 = p3 - pivot
+    l1 = v1.length
+    l2 = v2.length
+    if l1 <= 1e-9 or l2 <= 1e-9:
+        return pivot
+
+    u1 = v1 / l1
+    u2 = v2 / l2
+    bis = u1 + u2
+    if bis.length <= 1e-9:
+        bis = u1
+
+    radius = max(0.05, min(l1, l2) * 0.25)
+    return pivot + bis.normalized() * radius
+
+
+def _color_to_rgb255(color) -> tuple[int, int, int]:
+    r = int(max(0.0, min(1.0, float(color[0]))) * 255.0)
+    g = int(max(0.0, min(1.0, float(color[1]))) * 255.0)
+    b = int(max(0.0, min(1.0, float(color[2]))) * 255.0)
+    return r, g, b
+
+
+def _color_to_svg(color) -> str:
+    r, g, b = _color_to_rgb255(color)
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def _color_to_dxf_truecolor(color) -> int:
+    r, g, b = _color_to_rgb255(color)
+    return (r << 16) | (g << 8) | b
+
+
 def _sync_annotation_points_from_objects(ann):
     if ann.p1_object_name:
         obj1 = bpy.data.objects.get(ann.p1_object_name)
@@ -305,6 +369,10 @@ def _sync_annotation_points_from_objects(ann):
         obj2 = bpy.data.objects.get(ann.p2_object_name)
         if obj2 is not None:
             ann.p2 = obj2.matrix_world.translation
+    if ann.p3_object_name:
+        obj3 = bpy.data.objects.get(ann.p3_object_name)
+        if obj3 is not None:
+            ann.p3 = obj3.matrix_world.translation
 
 def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin: float, dmax: float, budget=None):
     cam_inv = camera.matrix_world.inverted()
@@ -321,6 +389,43 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
             if dmin <= depth <= dmax:
                 if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, p1_world, budget=budget):
                     world_texts.append((p1_world, ann.text.strip() or ann.name or "Note"))
+            continue
+
+        if ann.annotation_type == "ANGLE":
+            pivot_world = Vector(ann.p2)
+            p3_world = Vector(ann.p3)
+            pivot_cam = cam_inv @ pivot_world
+            p3_cam = cam_inv @ p3_world
+
+            clipped1 = _clip_segment_depth(pivot_cam, p1_cam, dmin, dmax)
+            clipped2 = _clip_segment_depth(pivot_cam, p3_cam, dmin, dmax)
+            any_line = False
+
+            for clipped in (clipped1, clipped2):
+                if clipped is None:
+                    continue
+                _c1_cam, _c2_cam, t0, t1 = clipped
+                c1_world = pivot_world.lerp(p1_world if clipped is clipped1 else p3_world, t0)
+                c2_world = pivot_world.lerp(p1_world if clipped is clipped1 else p3_world, t1)
+
+                vis_parts = [(0.0, 1.0)]
+                if settings.visible_only:
+                    vis_parts = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget)
+
+                for s0, s1 in vis_parts:
+                    v1_world = c1_world.lerp(c2_world, s0)
+                    v2_world = c1_world.lerp(c2_world, s1)
+                    if (v2_world - v1_world).length > 1e-8:
+                        world_lines.append((v1_world, v2_world))
+                        any_line = True
+
+            if any_line:
+                label = ann.text.strip() or _format_angle(p1_world, pivot_world, p3_world)
+                label_pos = _angle_label_position(p1_world, pivot_world, p3_world)
+                depth = _camera_depth(cam_inv @ label_pos)
+                if dmin <= depth <= dmax:
+                    if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, label_pos, budget=budget):
+                        world_texts.append((label_pos, label))
             continue
 
         p2_world = Vector(ann.p2)
@@ -485,9 +590,9 @@ def _draw_annotations_overlay_view():
 
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     gpu.state.blend_set("ALPHA")
-    gpu.state.depth_test_set("LESS_EQUAL")
+    gpu.state.depth_test_set("NONE" if settings.annotation_on_top else "LESS_EQUAL")
     shader.bind()
-    shader.uniform_float("color", (0.15, 0.55, 1.0, 0.95))
+    shader.uniform_float("color", tuple(settings.annotation_line_color))
     batch_for_shader(shader, "LINES", {"pos": line_vertices}).draw(shader)
     gpu.state.depth_test_set("NONE")
     gpu.state.blend_set("NONE")
@@ -516,7 +621,7 @@ def _draw_annotations_overlay_text():
 
     font_id = 0
     blf.size(font_id, int(max(8, settings.viewport_text_size)))
-    blf.color(font_id, 0.15, 0.55, 1.0, 1.0)
+    blf.color(font_id, *tuple(settings.annotation_text_color))
 
     for wpos, txt in world_texts:
         p2d = view3d_utils.location_3d_to_region_2d(context.region, context.region_data, wpos)
@@ -572,7 +677,7 @@ def _bounds_2d(segments, points, anno_lines, anno_texts):
     return min_x, min_y, max_x, max_y
 
 
-def _write_svg(filepath: str, segments, points, anno_lines, anno_texts, scale: float, margin: float, text_size: float):
+def _write_svg(filepath: str, segments, points, anno_lines, anno_texts, scale: float, margin: float, text_size: float, anno_line_color, anno_text_color):
     min_x, min_y, max_x, max_y = _bounds_2d(segments, points, anno_lines, anno_texts)
     width = (max_x - min_x) * scale + (2.0 * margin)
     height = (max_y - min_y) * scale + (2.0 * margin)
@@ -602,7 +707,9 @@ def _write_svg(filepath: str, segments, points, anno_lines, anno_texts, scale: f
         lines.append("</g>")
 
     if anno_lines:
-        lines.append('<g stroke="blue" fill="none" stroke-width="1.2">')
+        stroke = _color_to_svg(anno_line_color)
+        stroke_opacity = max(0.0, min(1.0, float(anno_line_color[3])))
+        lines.append(f'<g stroke="{stroke}" stroke-opacity="{stroke_opacity:.4f}" fill="none" stroke-width="1.2">')
         for (x1, y1), (x2, y2) in anno_lines:
             sx1, sy1 = map_xy(x1, y1)
             sx2, sy2 = map_xy(x2, y2)
@@ -610,7 +717,9 @@ def _write_svg(filepath: str, segments, points, anno_lines, anno_texts, scale: f
         lines.append("</g>")
 
     if anno_texts:
-        lines.append('<g fill="blue" stroke="none">')
+        fill = _color_to_svg(anno_text_color)
+        fill_opacity = max(0.0, min(1.0, float(anno_text_color[3])))
+        lines.append(f'<g fill="{fill}" fill-opacity="{fill_opacity:.4f}" stroke="none">')
         for (x, y), txt in anno_texts:
             sx, sy = map_xy(x, y)
             safe_txt = txt.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -620,20 +729,22 @@ def _write_svg(filepath: str, segments, points, anno_lines, anno_texts, scale: f
     lines.append("</svg>")
     Path(filepath).write_text("\n".join(lines), encoding="utf-8")
 
-def _write_dxf(filepath: str, segments, points, anno_lines, anno_texts, text_height: float):
+def _write_dxf(filepath: str, segments, points, anno_lines, anno_texts, text_height: float, anno_line_color, anno_text_color):
     lines = ["0", "SECTION", "2", "HEADER", "0", "ENDSEC", "0", "SECTION", "2", "TABLES", "0", "ENDSEC", "0", "SECTION", "2", "ENTITIES"]
+    line_truecolor = str(_color_to_dxf_truecolor(anno_line_color))
+    text_truecolor = str(_color_to_dxf_truecolor(anno_text_color))
 
     for (x1, y1), (x2, y2) in segments:
         lines.extend(["0", "LINE", "8", "0", "10", f"{x1:.6f}", "20", f"{y1:.6f}", "30", "0.0", "11", f"{x2:.6f}", "21", f"{y2:.6f}", "31", "0.0"])
 
     for (x1, y1), (x2, y2) in anno_lines:
-        lines.extend(["0", "LINE", "8", "ANNOTATIONS", "10", f"{x1:.6f}", "20", f"{y1:.6f}", "30", "0.0", "11", f"{x2:.6f}", "21", f"{y2:.6f}", "31", "0.0"])
+        lines.extend(["0", "LINE", "8", "ANNOTATIONS", "420", line_truecolor, "10", f"{x1:.6f}", "20", f"{y1:.6f}", "30", "0.0", "11", f"{x2:.6f}", "21", f"{y2:.6f}", "31", "0.0"])
 
     for x, y in points:
         lines.extend(["0", "POINT", "8", "0", "10", f"{x:.6f}", "20", f"{y:.6f}", "30", "0.0"])
 
     for (x, y), txt in anno_texts:
-        lines.extend(["0", "TEXT", "8", "ANNOTATIONS", "10", f"{x:.6f}", "20", f"{y:.6f}", "30", "0.0", "40", f"{text_height:.6f}", "1", txt])
+        lines.extend(["0", "TEXT", "8", "ANNOTATIONS", "420", text_truecolor, "10", f"{x:.6f}", "20", f"{y:.6f}", "30", "0.0", "40", f"{text_height:.6f}", "1", txt])
 
     lines.extend(["0", "ENDSEC", "0", "EOF"])
     Path(filepath).write_text("\n".join(lines), encoding="ascii", errors="ignore")
@@ -657,13 +768,38 @@ def _get_dimension_points_from_context(context: bpy.types.Context):
     return None, None, "Select 2 vertices in Edit Mode or 2 objects in Object Mode."
 
 
+def _get_angle_points_from_context(context: bpy.types.Context):
+    obj = context.active_object
+
+    if context.mode == "EDIT_MESH" and obj and obj.type == "MESH":
+        import bmesh
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        verts = [v for v in bm.verts if v.select]
+        if len(verts) == 3:
+            return (
+                obj.matrix_world @ verts[0].co,
+                obj.matrix_world @ verts[1].co,
+                obj.matrix_world @ verts[2].co,
+                None,
+            )
+
+    selected = [o for o in context.selected_objects if o.type in {"MESH", "EMPTY", "CURVE", "FONT", "LIGHT", "CAMERA"}]
+    if len(selected) >= 3:
+        return selected[0].matrix_world.translation.copy(), selected[1].matrix_world.translation.copy(), selected[2].matrix_world.translation.copy(), None
+
+    return None, None, None, "Select 3 vertices in Edit Mode or 3 objects in Object Mode."
+
+
 class MESHCUT_PG_annotation(PropertyGroup):
-    annotation_type: EnumProperty(name="Type", items=[("TEXT", "Text", "Text note"), ("DIMENSION", "Dimension", "Distance dimension")], default="TEXT")
+    annotation_type: EnumProperty(name="Type", items=[("TEXT", "Text", "Text note"), ("DIMENSION", "Dimension", "Distance dimension"), ("ANGLE", "Angle", "Angle dimension with 3 points")], default="TEXT")
     text: StringProperty(name="Text", default="")
     p1: FloatVectorProperty(name="P1", size=3, subtype="TRANSLATION", default=(0.0, 0.0, 0.0))
     p2: FloatVectorProperty(name="P2", size=3, subtype="TRANSLATION", default=(0.0, 0.0, 0.0))
+    p3: FloatVectorProperty(name="P3", size=3, subtype="TRANSLATION", default=(0.0, 0.0, 0.0))
     p1_object_name: StringProperty(name="P1 Object", default="")
     p2_object_name: StringProperty(name="P2 Object", default="")
+    p3_object_name: StringProperty(name="P3 Object", default="")
 
 
 class MESHCUT_PG_settings(PropertyGroup):
@@ -672,7 +808,7 @@ class MESHCUT_PG_settings(PropertyGroup):
     visible_only: BoolProperty(name="Visible Only (No X-Ray)", description="Cast rays from camera and keep only directly visible geometry", default=True)
     performance_guard: BoolProperty(name="Performance Guard", description="Limit ray-casts to avoid Blender freezes on heavy scenes", default=True)
     max_ray_casts: IntProperty(name="Max Ray Casts", description="Maximum visibility tests per export", default=150000, min=1000, max=10000000, soft_max=1000000)
-    budget_fallback_visible: BoolProperty(name="Fallback To Visible", description="When limit is reached, keep remaining geometry visible instead of skipping", default=True)
+    budget_fallback_visible: BoolProperty(name="Fallback To Visible", description="When limit is reached, keep remaining geometry visible instead of skipping (ignored when Visible Only is enabled)", default=False)
     visibility_samples: IntProperty(
         name="Visibility Samples",
         description="Samples per edge for hidden-line filtering (higher = cleaner, slower)",
@@ -691,6 +827,9 @@ class MESHCUT_PG_settings(PropertyGroup):
     new_text_label: StringProperty(name="New Text", description="Text used for new note", default="Note")
     new_dim_label: StringProperty(name="Dimension Label", description="Custom label for new dimensions (empty = auto length)", default="")
     dimension_default_length: FloatProperty(name="Dimension Length", description="Default length when creating a new dimension object", default=1.0, min=0.001, soft_max=1000.0)
+    annotation_on_top: BoolProperty(name="Annotations On Top", description="Draw annotation lines over geometry in viewport", default=True, update=_update_redraw)
+    annotation_line_color: FloatVectorProperty(name="Annotation Line Color", description="Line color for annotation preview and export", subtype="COLOR", size=4, min=0.0, max=1.0, default=(1.0, 0.85, 0.1, 0.95), update=_update_redraw)
+    annotation_text_color: FloatVectorProperty(name="Annotation Text Color", description="Text color for annotation preview and export", subtype="COLOR", size=4, min=0.0, max=1.0, default=(1.0, 0.95, 0.75, 1.0), update=_update_redraw)
     show_annotation_preview: BoolProperty(name="Show Annotation Preview", description="Show dimensions and notes in viewport", default=True, update=_update_redraw)
     preview_only_camera_view: BoolProperty(name="Preview Only Camera View", description="Show preview only when looking through the configured camera", default=True, update=_update_redraw)
     viewport_text_size: IntProperty(name="Viewport Text Size", description="Text size for viewport preview", default=14, min=8, max=72)
@@ -699,7 +838,11 @@ class MESHCUT_PG_settings(PropertyGroup):
 
 class MESHCUT_UL_annotations(UIList):
     def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
-        icon = "FONT_DATA" if item.annotation_type == "TEXT" else "DRIVER_DISTANCE"
+        icon = "FONT_DATA"
+        if item.annotation_type == "DIMENSION":
+            icon = "DRIVER_DISTANCE"
+        elif item.annotation_type == "ANGLE":
+            icon = "DRIVER_ROTATIONAL_DIFFERENCE"
         layout.label(text=(item.text if item.text else item.name), icon=icon)
 
 
@@ -718,9 +861,11 @@ class MESHCUT_OT_add_text_annotation(Operator):
         cursor = scene.cursor.location.copy()
         ann.p1 = cursor
         ann.p2 = cursor
+        ann.p3 = cursor
         obj = _create_annotation_empty(scene, f"MC_Text_{len(scene.meshcut_annotations):03d}", cursor)
         ann.p1_object_name = obj.name
         ann.p2_object_name = ""
+        ann.p3_object_name = ""
         scene.meshcut_annotation_index = len(scene.meshcut_annotations) - 1
         self.report({"INFO"}, "Text annotation created.")
         return {"FINISHED"}
@@ -744,12 +889,47 @@ class MESHCUT_OT_add_dimension_annotation(Operator):
         ann.name = f"Dim {len(scene.meshcut_annotations)}"
         ann.p1 = p1
         ann.p2 = p2
+        ann.p3 = p2
         obj1 = _create_annotation_empty(scene, f"MC_Dim_A_{len(scene.meshcut_annotations):03d}", Vector(p1))
         obj2 = _create_annotation_empty(scene, f"MC_Dim_B_{len(scene.meshcut_annotations):03d}", Vector(p2))
         ann.p1_object_name = obj1.name
         ann.p2_object_name = obj2.name
+        ann.p3_object_name = ""
         scene.meshcut_annotation_index = len(scene.meshcut_annotations) - 1
         self.report({"INFO"}, "Dimension object created. Move A/B empties to set endpoints.")
+        return {"FINISHED"}
+
+
+class MESHCUT_OT_add_angle_annotation(Operator):
+    bl_idname = "meshcut.add_angle_annotation"
+    bl_label = "Add Angle Dimension"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.meshcut_settings
+        p1, p2, p3, err = _get_angle_points_from_context(context)
+        if err:
+            cursor = scene.cursor.location.copy()
+            p1 = cursor + Vector((settings.dimension_default_length, 0.0, 0.0))
+            p2 = cursor
+            p3 = cursor + Vector((0.0, settings.dimension_default_length, 0.0))
+
+        ann = scene.meshcut_annotations.add()
+        ann.annotation_type = "ANGLE"
+        ann.text = settings.new_dim_label.strip()
+        ann.name = f"Angle {len(scene.meshcut_annotations)}"
+        ann.p1 = p1
+        ann.p2 = p2
+        ann.p3 = p3
+        obj1 = _create_annotation_empty(scene, f"MC_Ang_A_{len(scene.meshcut_annotations):03d}", Vector(p1))
+        obj2 = _create_annotation_empty(scene, f"MC_Ang_B_{len(scene.meshcut_annotations):03d}", Vector(p2))
+        obj3 = _create_annotation_empty(scene, f"MC_Ang_C_{len(scene.meshcut_annotations):03d}", Vector(p3))
+        ann.p1_object_name = obj1.name
+        ann.p2_object_name = obj2.name
+        ann.p3_object_name = obj3.name
+        scene.meshcut_annotation_index = len(scene.meshcut_annotations) - 1
+        self.report({"INFO"}, "Angle dimension created. Move A/B/C empties (B is the vertex).")
         return {"FINISHED"}
 
 
@@ -767,6 +947,7 @@ class MESHCUT_OT_remove_annotation(Operator):
         ann = scene.meshcut_annotations[idx]
         _remove_annotation_object(ann.p1_object_name)
         _remove_annotation_object(ann.p2_object_name)
+        _remove_annotation_object(ann.p3_object_name)
         scene.meshcut_annotations.remove(idx)
         scene.meshcut_annotation_index = min(idx, max(0, len(scene.meshcut_annotations) - 1))
         self.report({"INFO"}, "Annotation removed.")
@@ -783,6 +964,7 @@ class MESHCUT_OT_clear_annotations(Operator):
         for ann in scene.meshcut_annotations:
             _remove_annotation_object(ann.p1_object_name)
             _remove_annotation_object(ann.p2_object_name)
+            _remove_annotation_object(ann.p3_object_name)
         scene.meshcut_annotations.clear()
         scene.meshcut_annotation_index = 0
         self.report({"INFO"}, "All annotations cleared.")
@@ -839,11 +1021,23 @@ class MESHCUT_OT_export_svg(Operator):
         settings = (getattr(context, "scene", None) or bpy.context.scene).meshcut_settings
         try:
             segments, points, anno_lines, anno_texts, budget = _collect_segments(context)
-            _write_svg(self.filepath, segments, points, anno_lines, anno_texts, settings.svg_scale, settings.svg_margin, settings.svg_text_size)
+            _write_svg(
+                self.filepath,
+                segments,
+                points,
+                anno_lines,
+                anno_texts,
+                settings.svg_scale,
+                settings.svg_margin,
+                settings.svg_text_size,
+                settings.annotation_line_color,
+                settings.annotation_text_color,
+            )
             if budget["enabled"] and budget["limit_hit"]:
+                mode = "fallback visibility" if budget["fallback_visible"] else "hidden remainder"
                 self.report(
                     {"WARNING"},
-                    f"Performance guard hit ({budget['ray_casts']} ray casts). Export used fallback visibility.",
+                    f"Performance guard hit ({budget['ray_casts']} ray casts). Export mode: {mode}.",
                 )
             self.report({"INFO"}, f"SVG exported: {self.filepath}")
             return {"FINISHED"}
@@ -871,11 +1065,21 @@ class MESHCUT_OT_export_dxf(Operator):
         settings = (getattr(context, "scene", None) or bpy.context.scene).meshcut_settings
         try:
             segments, points, anno_lines, anno_texts, budget = _collect_segments(context)
-            _write_dxf(self.filepath, segments, points, anno_lines, anno_texts, settings.dxf_text_height)
+            _write_dxf(
+                self.filepath,
+                segments,
+                points,
+                anno_lines,
+                anno_texts,
+                settings.dxf_text_height,
+                settings.annotation_line_color,
+                settings.annotation_text_color,
+            )
             if budget["enabled"] and budget["limit_hit"]:
+                mode = "fallback visibility" if budget["fallback_visible"] else "hidden remainder"
                 self.report(
                     {"WARNING"},
-                    f"Performance guard hit ({budget['ray_casts']} ray casts). Export used fallback visibility.",
+                    f"Performance guard hit ({budget['ray_casts']} ray casts). Export mode: {mode}.",
                 )
             self.report({"INFO"}, f"DXF exported: {self.filepath}")
             return {"FINISHED"}
@@ -935,12 +1139,16 @@ class MESHCUT_PT_panel(Panel):
         col.separator(); col.label(text="Annotations")
         col.prop(settings, "show_annotation_preview")
         col.prop(settings, "preview_only_camera_view")
+        col.prop(settings, "annotation_on_top")
+        col.prop(settings, "annotation_line_color")
+        col.prop(settings, "annotation_text_color")
         col.prop(settings, "viewport_text_size")
         col.prop(settings, "new_text_label")
         col.operator("meshcut.add_text_annotation", icon="FONT_DATA")
         col.prop(settings, "new_dim_label")
         col.prop(settings, "dimension_default_length")
         col.operator("meshcut.add_dimension_annotation", icon="DRIVER_DISTANCE")
+        col.operator("meshcut.add_angle_annotation", icon="DRIVER_ROTATIONAL_DIFFERENCE")
         col.template_list("MESHCUT_UL_annotations", "", scene, "meshcut_annotations", scene, "meshcut_annotation_index", rows=4)
 
         row = col.row(align=True)
@@ -962,6 +1170,7 @@ classes = (
     MESHCUT_UL_annotations,
     MESHCUT_OT_add_text_annotation,
     MESHCUT_OT_add_dimension_annotation,
+    MESHCUT_OT_add_angle_annotation,
     MESHCUT_OT_remove_annotation,
     MESHCUT_OT_clear_annotations,
     MESHCUT_OT_create_camera,
