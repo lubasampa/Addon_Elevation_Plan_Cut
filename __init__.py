@@ -1,7 +1,7 @@
 ﻿bl_info = {
     "name": "Mesh Cut Plan/Elevation",
     "author": "Luiz + Codex",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Mesh Cut",
     "description": "Camera-based plan/elevation cuts for any mesh object with SVG/DXF export",
@@ -19,6 +19,8 @@ from bpy.types import Operator, Panel, PropertyGroup, UIList
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
+
+from .meshcut_accel import build_visibility_acceleration, visibility_mask
 from mathutils.geometry import intersect_line_plane
 
 _DRAW_HANDLE_VIEW = None
@@ -150,39 +152,43 @@ def _create_performance_budget(settings):
     }
 
 
-def _is_world_point_visible(scene, depsgraph, camera, point_world: Vector, epsilon: float = 1e-4, budget=None) -> bool:
+def _ray_from_camera(camera, point_world: Vector, epsilon: float = 1e-4):
+    if camera.data.type == "ORTHO":
+        cam_inv = camera.matrix_world.inverted()
+        p_cam = cam_inv @ point_world
+        dist = -p_cam.z
+        if dist <= epsilon:
+            return None
+
+        origin = camera.matrix_world @ Vector((p_cam.x, p_cam.y, 0.0))
+        direction = camera.matrix_world.to_quaternion() @ Vector((0.0, 0.0, -1.0))
+        return origin, direction, dist
+
+    origin = camera.matrix_world.translation
+    ray = point_world - origin
+    dist = ray.length
+    if dist <= epsilon:
+        return None
+    direction = ray / dist
+    return origin, direction, dist
+
+
+def _is_world_point_visible(scene, depsgraph, camera, point_world: Vector, epsilon: float = 1e-4, budget=None, accel=None) -> bool:
     if budget and budget["enabled"]:
         if budget["ray_casts"] >= budget["max_ray_casts"]:
             budget["limit_hit"] = True
             return True if budget["fallback_visible"] else False
         budget["ray_casts"] += 1
 
-    if camera.data.type == "ORTHO":
-        cam_inv = camera.matrix_world.inverted()
-        p_cam = cam_inv @ point_world
-        dist = -p_cam.z
-        if dist <= epsilon:
-            return True
-
-        origin = camera.matrix_world @ Vector((p_cam.x, p_cam.y, 0.0))
-        direction = camera.matrix_world.to_quaternion() @ Vector((0.0, 0.0, -1.0))
-    else:
-        origin = camera.matrix_world.translation
-        ray = point_world - origin
-        dist = ray.length
-        if dist <= epsilon:
-            return True
-        direction = ray / dist
-
-    hit, location, _normal, _index, _obj, _matrix = scene.ray_cast(depsgraph, origin, direction, distance=dist + epsilon)
-    if not hit:
+    ray_data = _ray_from_camera(camera, point_world, epsilon=epsilon)
+    if ray_data is None:
         return True
 
-    hit_dist = (location - origin).length
-    return hit_dist >= dist - epsilon
+    origin, direction, dist = ray_data
+    return visibility_mask(scene, accel, [origin], [direction], [dist], epsilon=epsilon)[0]
 
 
-def _visible_intervals_on_segment(scene, depsgraph, camera, p1_world: Vector, p2_world: Vector, samples: int, budget=None):
+def _visible_intervals_on_segment(scene, depsgraph, camera, p1_world: Vector, p2_world: Vector, samples: int, budget=None, accel=None):
     if budget and budget["enabled"] and budget["limit_hit"] and budget["fallback_visible"]:
         return [(0.0, 1.0)]
 
@@ -192,7 +198,7 @@ def _visible_intervals_on_segment(scene, depsgraph, camera, p1_world: Vector, p2
 
     for i in range(samples + 1):
         t = i * step
-        vis_flags.append(_is_world_point_visible(scene, depsgraph, camera, p1_world.lerp(p2_world, t), budget=budget))
+        vis_flags.append(_is_world_point_visible(scene, depsgraph, camera, p1_world.lerp(p2_world, t), budget=budget, accel=accel))
         if budget and budget["enabled"] and budget["limit_hit"] and budget["fallback_visible"]:
             return [(0.0, 1.0)]
 
@@ -374,7 +380,7 @@ def _sync_annotation_points_from_objects(ann):
         if obj3 is not None:
             ann.p3 = obj3.matrix_world.translation
 
-def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin: float, dmax: float, budget=None):
+def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin: float, dmax: float, budget=None, accel=None):
     cam_inv = camera.matrix_world.inverted()
     world_lines = []
     world_texts = []
@@ -387,7 +393,7 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
         if ann.annotation_type == "TEXT":
             depth = _camera_depth(p1_cam)
             if dmin <= depth <= dmax:
-                if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, p1_world, budget=budget):
+                if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, p1_world, budget=budget, accel=accel):
                     world_texts.append((p1_world, ann.text.strip() or ann.name or "Note"))
             continue
 
@@ -410,7 +416,7 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
 
                 vis_parts = [(0.0, 1.0)]
                 if settings.visible_only:
-                    vis_parts = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget)
+                    vis_parts = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget, accel=accel)
 
                 for s0, s1 in vis_parts:
                     v1_world = c1_world.lerp(c2_world, s0)
@@ -424,7 +430,7 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
                 label_pos = _angle_label_position(p1_world, pivot_world, p3_world)
                 depth = _camera_depth(cam_inv @ label_pos)
                 if dmin <= depth <= dmax:
-                    if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, label_pos, budget=budget):
+                    if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, label_pos, budget=budget, accel=accel):
                         world_texts.append((label_pos, label))
             continue
 
@@ -440,7 +446,7 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
 
         vis_parts = [(0.0, 1.0)]
         if settings.visible_only:
-            vis_parts = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget)
+            vis_parts = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget, accel=accel)
 
         any_line = False
         for s0, s1 in vis_parts:
@@ -453,15 +459,15 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
         if any_line:
             label = ann.text.strip() or _format_length(scene, (c2_world - c1_world).length)
             mid_world = (c1_world + c2_world) * 0.5
-            if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, mid_world, budget=budget):
+            if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, mid_world, budget=budget, accel=accel):
                 world_texts.append((mid_world, label))
 
     return world_lines, world_texts
 
 
-def _collect_annotation_geometry(scene, depsgraph, camera, settings, dmin: float, dmax: float, budget=None):
+def _collect_annotation_geometry(scene, depsgraph, camera, settings, dmin: float, dmax: float, budget=None, accel=None):
     cam_inv = camera.matrix_world.inverted()
-    world_lines, world_texts = _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin, dmax, budget=budget)
+    world_lines, world_texts = _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin, dmax, budget=budget, accel=accel)
     anno_lines = []
     anno_texts = []
 
@@ -495,6 +501,7 @@ def _collect_segments(context: bpy.types.Context):
     segments = []
     points = []
     budget = _create_performance_budget(settings)
+    accel = build_visibility_acceleration(mesh_objects, depsgraph)
 
     dmin = min(settings.depth_near, settings.depth_far)
     dmax = max(settings.depth_near, settings.depth_far)
@@ -514,7 +521,7 @@ def _collect_segments(context: bpy.types.Context):
                 for p_cam, p_world in zip(cam_verts, world_verts):
                     depth = _camera_depth(p_cam)
                     if dmin <= depth <= dmax:
-                        if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, p_world, budget=budget):
+                        if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, p_world, budget=budget, accel=accel):
                             points.append(_project_point(camera, p_cam))
 
             for edge in mesh.edges:
@@ -537,7 +544,7 @@ def _collect_segments(context: bpy.types.Context):
                     segments.append((_project_point(camera, c1_cam), _project_point(camera, c2_cam)))
                     continue
 
-                intervals = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget)
+                intervals = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget, accel=accel)
                 for s0, s1 in intervals:
                     v1_cam = c1_cam.lerp(c2_cam, s0)
                     v2_cam = c1_cam.lerp(c2_cam, s1)
@@ -546,7 +553,7 @@ def _collect_segments(context: bpy.types.Context):
         finally:
             eval_obj.to_mesh_clear()
 
-    anno_lines, anno_texts = _collect_annotation_geometry(scene, depsgraph, camera, settings, dmin, dmax, budget=budget)
+    anno_lines, anno_texts = _collect_annotation_geometry(scene, depsgraph, camera, settings, dmin, dmax, budget=budget, accel=accel)
 
     if not segments and not points and not anno_lines and not anno_texts:
         raise RuntimeError("Nothing to export with current depth settings.")
@@ -573,7 +580,9 @@ def _draw_annotations_overlay_view():
     depsgraph = context.evaluated_depsgraph_get()
     dmin = min(settings.depth_near, settings.depth_far)
     dmax = max(settings.depth_near, settings.depth_far)
-    world_lines, _world_texts = _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin, dmax)
+    preview_meshes = [obj for obj in context.view_layer.objects if obj.type == "MESH" and obj.visible_get(view_layer=context.view_layer)]
+    accel = build_visibility_acceleration(preview_meshes, depsgraph)
+    world_lines, _world_texts = _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin, dmax, accel=accel)
 
     if not world_lines and not _DRAW_DIMENSION_PREVIEW["active"]:
         return
@@ -617,7 +626,9 @@ def _draw_annotations_overlay_text():
     depsgraph = context.evaluated_depsgraph_get()
     dmin = min(settings.depth_near, settings.depth_far)
     dmax = max(settings.depth_near, settings.depth_far)
-    _world_lines, world_texts = _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin, dmax)
+    preview_meshes = [obj for obj in context.view_layer.objects if obj.type == "MESH" and obj.visible_get(view_layer=context.view_layer)]
+    accel = build_visibility_acceleration(preview_meshes, depsgraph)
+    _world_lines, world_texts = _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin, dmax, accel=accel)
 
     font_id = 0
     blf.size(font_id, int(max(8, settings.viewport_text_size)))

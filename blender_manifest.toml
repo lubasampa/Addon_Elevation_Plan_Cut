@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "meshcutplanelevation"
-version = "0.1.1"
+version = "0.2.0"
 name = "Mesh Cut Plan/Elevation"
 tagline = "Camera-based cuts and projection export (SVG/DXF) for any Mesh"
 maintainer = "Luiz <luiz@example.com>"
