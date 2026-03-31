@@ -704,6 +704,7 @@ def _collect_segments(context: bpy.types.Context, progress=None):
             world_verts = [world_mat @ v.co for v in mesh.vertices]
             cam_verts = [cam_inv @ p for p in world_verts]
             vertex_count = len(world_verts) if settings.export_vertices else 0
+            edge_count = len(mesh.edges)
 
             if settings.export_vertices:
                 for vertex_index, (p_cam, p_world) in enumerate(zip(cam_verts, world_verts), start=1):
@@ -745,7 +746,7 @@ def _collect_segments(context: bpy.types.Context, progress=None):
                     _update_mesh_progress(f"Tracing edges: {obj.name}", local_done=vertex_count + edge_index)
         finally:
             eval_obj.to_mesh_clear()
-        mesh_work_done += len(mesh.edges)
+        mesh_work_done += edge_count
         _update_mesh_progress(f"Object complete: {obj.name}", force=True)
 
     if progress is not None:
