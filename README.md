@@ -6,6 +6,7 @@ Blender add-on for plan, section, and elevation line extraction with SVG and DXF
 
 - `__init__.py`: main add-on entrypoint, UI, export flow, annotation tools, and visibility integration.
 - `meshcut_accel.py`: BVH acceleration builder plus the visibility dispatcher that chooses Cython, Python BVH, or `scene.ray_cast`.
+- `native_backend/`: package-scoped location for compiled extension modules shipped with the add-on.
 - `cython/meshcut_parallel.pyx`: optional parallel ray-triangle kernel based on Moller-Trumbore intersection.
 - `cython/setup.py`: build script for the optional `meshcut_parallel` extension.
 - `blender_manifest.toml`: add-on manifest metadata.
@@ -41,7 +42,7 @@ py -m pip install cython setuptools wheel
 py setup.py build_ext --inplace
 ```
 
-After the build completes, copy the generated `meshcut_parallel*.pyd` or `meshcut_parallel*.so` file to the add-on root, next to `__init__.py`.
+After the build completes, copy the generated `meshcut_parallel*.pyd` or `meshcut_parallel*.so` file into `native_backend/`.
 
 ## UI Options
 

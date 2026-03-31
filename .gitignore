@@ -5,3 +5,5 @@ cython/build/
 cython/*.c
 cython/*.pyd
 meshcut_parallel*.pyd
+native_backend/*.pyd
+native_backend/*.so

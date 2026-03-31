@@ -178,7 +178,7 @@ def _cython_requirement_message() -> str:
         "Require Cython Backend is enabled, but meshcut_parallel is missing. "
         "Build it with 'python -m pip install cython setuptools wheel' and "
         "'python setup.py build_ext --inplace' inside the cython folder, then "
-        "copy the generated meshcut_parallel binary next to __init__.py."
+        "copy the generated meshcut_parallel binary into native_backend/."
     )
 
 

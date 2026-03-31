@@ -11,7 +11,9 @@ from mathutils.bvhtree import BVHTree
 
 try:
     # Compiled optional module (built from cython/meshcut_parallel.pyx).
-    from . import meshcut_parallel as _cy_parallel
+    from . import native_backend as _native_backend
+
+    _cy_parallel = _native_backend.load_meshcut_parallel()
 except Exception:  # pragma: no cover - Blender runtime dependent
     _cy_parallel = None
 
@@ -32,7 +34,7 @@ def _cython_required_error() -> RuntimeError:
         "Cython backend is required, but meshcut_parallel is not available. "
         "Build it with 'python -m pip install cython setuptools wheel', "
         "then run 'python setup.py build_ext --inplace' inside the cython folder "
-        "and copy the generated meshcut_parallel binary next to __init__.py."
+        "and copy the generated meshcut_parallel binary into native_backend/."
     )
 
 
