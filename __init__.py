@@ -9,6 +9,7 @@
 }
 
 import math
+import time
 from pathlib import Path
 
 import bpy
@@ -82,6 +83,83 @@ def _tag_redraw_view3d() -> None:
 
 def _update_redraw(_self=None, _context=None):
     _tag_redraw_view3d()
+
+
+def _tag_redraw_all_areas() -> None:
+    wm = bpy.context.window_manager
+    for window in wm.windows:
+        screen = window.screen
+        if not screen:
+            continue
+        for area in screen.areas:
+            area.tag_redraw()
+
+
+class _ProgressReporter:
+    def __init__(self, context: bpy.types.Context, label: str):
+        self._context = context
+        self._label = label
+        self._wm = getattr(context, "window_manager", None) or bpy.context.window_manager
+        self._workspace = getattr(context, "workspace", None) or getattr(bpy.context, "workspace", None)
+        self._window = getattr(context, "window", None) or getattr(bpy.context, "window", None)
+        self._active = False
+        self._last_value = -1
+        self._last_redraw = 0.0
+        self._last_status = ""
+        self._scale = 1000
+
+    def begin(self, text: str):
+        if self._active:
+            return
+        self._wm.progress_begin(0, self._scale)
+        self._active = True
+        if self._window is not None:
+            try:
+                self._window.cursor_set("WAIT")
+            except Exception:
+                pass
+        self.update(0.0, text, force=True)
+
+    def update(self, fraction: float, text: str | None = None, force: bool = False):
+        if not self._active:
+            self.begin(text or self._label)
+            return
+
+        fraction = max(0.0, min(1.0, fraction))
+        value = int(fraction * self._scale)
+        now = time.monotonic()
+        status_text = self._label if not text else f"{self._label}: {text}"
+        if not force and value == self._last_value and status_text == self._last_status and (now - self._last_redraw) < 0.1:
+            return
+
+        self._wm.progress_update(value)
+        if self._workspace is not None:
+            try:
+                self._workspace.status_text_set(status_text)
+            except Exception:
+                pass
+        if force or (now - self._last_redraw) >= 0.1:
+            _tag_redraw_all_areas()
+            self._last_redraw = now
+        self._last_value = value
+        self._last_status = status_text
+
+    def end(self):
+        if not self._active:
+            return
+        self._wm.progress_end()
+        if self._workspace is not None:
+            try:
+                self._workspace.status_text_set(None)
+            except Exception:
+                pass
+        if self._window is not None:
+            try:
+                self._window.cursor_set("DEFAULT")
+            except Exception:
+                pass
+        _tag_redraw_all_areas()
+        self._active = False
 
 
 def _camera_depth(local_point: Vector) -> float:
@@ -444,12 +522,16 @@ def _sync_annotation_points_from_objects(ann):
         if obj3 is not None:
             ann.p3 = obj3.matrix_world.translation
 
-def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin: float, dmax: float, budget=None, accel=None):
+def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin: float, dmax: float, budget=None, accel=None, progress=None):
     cam_inv = camera.matrix_world.inverted()
     world_lines = []
     world_texts = []
+    annotations = list(scene.meshcut_annotations)
+    total_annotations = max(1, len(annotations))
 
-    for ann in scene.meshcut_annotations:
+    for index, ann in enumerate(annotations):
+        if progress is not None:
+            progress(index / total_annotations, f"Processing annotations: {ann.name or ann.text or ann.annotation_type}")
         _sync_annotation_points_from_objects(ann)
         p1_world = Vector(ann.p1)
         p1_cam = cam_inv @ p1_world
@@ -526,12 +608,24 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
             if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, mid_world, budget=budget, accel=accel):
                 world_texts.append((mid_world, label))
 
+    if progress is not None:
+        progress(1.0, "Annotations ready")
     return world_lines, world_texts
 
 
-def _collect_annotation_geometry(scene, depsgraph, camera, settings, dmin: float, dmax: float, budget=None, accel=None):
+def _collect_annotation_geometry(scene, depsgraph, camera, settings, dmin: float, dmax: float, budget=None, accel=None, progress=None):
     cam_inv = camera.matrix_world.inverted()
-    world_lines, world_texts = _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin, dmax, budget=budget, accel=accel)
+    world_lines, world_texts = _collect_annotation_world_geometry(
+        scene,
+        depsgraph,
+        camera,
+        settings,
+        dmin,
+        dmax,
+        budget=budget,
+        accel=accel,
+        progress=progress,
+    )
     anno_lines = []
     anno_texts = []
 
@@ -544,7 +638,7 @@ def _collect_annotation_geometry(scene, depsgraph, camera, settings, dmin: float
     return anno_lines, anno_texts
 
 
-def _collect_segments(context: bpy.types.Context):
+def _collect_segments(context: bpy.types.Context, progress=None):
     scene, view_layer, depsgraph = _resolve_export_context(context)
     settings = scene.meshcut_settings
     camera = settings.camera_obj or scene.camera
@@ -567,10 +661,36 @@ def _collect_segments(context: bpy.types.Context):
     budget = _create_performance_budget(settings)
     if budget["require_cython"] and not cython_backend_available():
         raise RuntimeError(_cython_requirement_message())
-    accel = build_visibility_acceleration(mesh_objects, depsgraph)
+    if progress is not None:
+        progress.update(0.02, "Preparing visibility acceleration", force=True)
+    accel = build_visibility_acceleration(
+        mesh_objects,
+        depsgraph,
+        progress_callback=(
+            None
+            if progress is None
+            else lambda local_fraction, text: progress.update(0.02 + (0.18 * local_fraction), text)
+        ),
+    )
 
     dmin = min(settings.depth_near, settings.depth_far)
     dmax = max(settings.depth_near, settings.depth_far)
+    mesh_work_total = 0
+    for obj in mesh_objects:
+        data = getattr(obj, "data", None)
+        if data is None:
+            continue
+        if settings.export_vertices:
+            mesh_work_total += len(data.vertices)
+        mesh_work_total += len(data.edges)
+    mesh_work_total = max(1, mesh_work_total)
+    mesh_work_done = 0
+
+    def _update_mesh_progress(detail: str, local_done: int = 0, force: bool = False):
+        if progress is None:
+            return
+        fraction = (mesh_work_done + local_done) / mesh_work_total
+        progress.update(0.20 + (0.68 * fraction), detail, force=force)
 
     for obj in mesh_objects:
         eval_obj = obj.evaluated_get(depsgraph)
@@ -579,18 +699,23 @@ def _collect_segments(context: bpy.types.Context):
             continue
 
         try:
+            _update_mesh_progress(f"Tracing object: {obj.name}", force=True)
             world_mat = eval_obj.matrix_world
             world_verts = [world_mat @ v.co for v in mesh.vertices]
             cam_verts = [cam_inv @ p for p in world_verts]
+            vertex_count = len(world_verts) if settings.export_vertices else 0
 
             if settings.export_vertices:
-                for p_cam, p_world in zip(cam_verts, world_verts):
+                for vertex_index, (p_cam, p_world) in enumerate(zip(cam_verts, world_verts), start=1):
                     depth = _camera_depth(p_cam)
                     if dmin <= depth <= dmax:
                         if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, p_world, budget=budget, accel=accel):
                             points.append(_project_point(camera, p_cam))
+                    if (vertex_index % 512) == 0:
+                        _update_mesh_progress(f"Tracing vertices: {obj.name}", local_done=vertex_index)
+                mesh_work_done += len(world_verts)
 
-            for edge in mesh.edges:
+            for edge_index, edge in enumerate(mesh.edges, start=1):
                 i1 = edge.vertices[0]
                 i2 = edge.vertices[1]
                 p1_cam = cam_verts[i1]
@@ -616,14 +741,36 @@ def _collect_segments(context: bpy.types.Context):
                     v2_cam = c1_cam.lerp(c2_cam, s1)
                     if (v2_cam - v1_cam).length > 1e-8:
                         segments.append((_project_point(camera, v1_cam), _project_point(camera, v2_cam)))
+                if (edge_index % 256) == 0:
+                    _update_mesh_progress(f"Tracing edges: {obj.name}", local_done=vertex_count + edge_index)
         finally:
             eval_obj.to_mesh_clear()
+        mesh_work_done += len(mesh.edges)
+        _update_mesh_progress(f"Object complete: {obj.name}", force=True)
 
-    anno_lines, anno_texts = _collect_annotation_geometry(scene, depsgraph, camera, settings, dmin, dmax, budget=budget, accel=accel)
+    if progress is not None:
+        progress.update(0.90, "Projecting annotations", force=True)
+    anno_lines, anno_texts = _collect_annotation_geometry(
+        scene,
+        depsgraph,
+        camera,
+        settings,
+        dmin,
+        dmax,
+        budget=budget,
+        accel=accel,
+        progress=(
+            None
+            if progress is None
+            else lambda local_fraction, text: progress.update(0.90 + (0.08 * local_fraction), text)
+        ),
+    )
 
     if not segments and not points and not anno_lines and not anno_texts:
         raise RuntimeError("Nothing to export with current depth settings.")
 
+    if progress is not None:
+        progress.update(0.98, "Finalizing export data", force=True)
     return segments, points, anno_lines, anno_texts, budget
 
 
@@ -1098,8 +1245,11 @@ class MESHCUT_OT_export_svg(Operator):
 
     def execute(self, context):
         settings = (getattr(context, "scene", None) or bpy.context.scene).meshcut_settings
+        progress = _ProgressReporter(context, "Mesh Cut SVG Export")
         try:
-            segments, points, anno_lines, anno_texts, budget = _collect_segments(context)
+            progress.begin("Collecting mesh geometry")
+            segments, points, anno_lines, anno_texts, budget = _collect_segments(context, progress=progress)
+            progress.update(0.99, "Writing SVG file", force=True)
             _write_svg(
                 self.filepath,
                 segments,
@@ -1123,11 +1273,14 @@ class MESHCUT_OT_export_svg(Operator):
                     {"WARNING"},
                     f"Performance guard hit ({budget['ray_casts']} ray casts). Export mode: {mode}.",
                 )
+            progress.update(1.0, "SVG export complete", force=True)
             self.report({"INFO"}, f"SVG exported: {self.filepath}")
             return {"FINISHED"}
         except Exception as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        finally:
+            progress.end()
 
     def invoke(self, context, _event):
         if not self.filepath:
@@ -1147,8 +1300,11 @@ class MESHCUT_OT_export_dxf(Operator):
 
     def execute(self, context):
         settings = (getattr(context, "scene", None) or bpy.context.scene).meshcut_settings
+        progress = _ProgressReporter(context, "Mesh Cut DXF Export")
         try:
-            segments, points, anno_lines, anno_texts, budget = _collect_segments(context)
+            progress.begin("Collecting mesh geometry")
+            segments, points, anno_lines, anno_texts, budget = _collect_segments(context, progress=progress)
+            progress.update(0.99, "Writing DXF file", force=True)
             _write_dxf(
                 self.filepath,
                 segments,
@@ -1170,11 +1326,14 @@ class MESHCUT_OT_export_dxf(Operator):
                     {"WARNING"},
                     f"Performance guard hit ({budget['ray_casts']} ray casts). Export mode: {mode}.",
                 )
+            progress.update(1.0, "DXF export complete", force=True)
             self.report({"INFO"}, f"DXF exported: {self.filepath}")
             return {"FINISHED"}
         except Exception as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        finally:
+            progress.end()
 
     def invoke(self, context, _event):
         if not self.filepath:

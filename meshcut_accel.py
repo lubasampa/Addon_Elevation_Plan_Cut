@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import bpy
 from mathutils import Vector
@@ -38,13 +38,21 @@ def _cython_required_error() -> RuntimeError:
     )
 
 
-def build_visibility_acceleration(mesh_objects: Iterable[bpy.types.Object], depsgraph: bpy.types.Depsgraph):
+def build_visibility_acceleration(
+    mesh_objects: Iterable[bpy.types.Object],
+    depsgraph: bpy.types.Depsgraph,
+    progress_callback: Callable[[float, str], None] | None = None,
+):
     """Build BVH and flattened triangle data from evaluated meshes."""
+    mesh_objects = list(mesh_objects)
     vertices: list[tuple[float, float, float]] = []
     polygons: list[tuple[int, int, int]] = []
     tri_vertices: list[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]] = []
 
-    for obj in mesh_objects:
+    total_objects = max(1, len(mesh_objects))
+    for index, obj in enumerate(mesh_objects):
+        if progress_callback is not None:
+            progress_callback(index / total_objects, f"Building visibility acceleration: {obj.name}")
         eval_obj = obj.evaluated_get(depsgraph)
         mesh = eval_obj.to_mesh()
         if mesh is None:
@@ -67,9 +75,13 @@ def build_visibility_acceleration(mesh_objects: Iterable[bpy.types.Object], deps
             eval_obj.to_mesh_clear()
 
     if not polygons:
+        if progress_callback is not None:
+            progress_callback(1.0, "Visibility acceleration not needed")
         return VisibilityAcceleration(depsgraph=depsgraph, bvh=None, tri_vertices=[])
 
     bvh = BVHTree.FromPolygons(vertices, polygons, all_triangles=True)
+    if progress_callback is not None:
+        progress_callback(1.0, "Visibility acceleration ready")
     return VisibilityAcceleration(depsgraph=depsgraph, bvh=bvh, tri_vertices=tri_vertices)
 
 
