@@ -1,7 +1,7 @@
 ﻿bl_info = {
     "name": "Mesh Cut Plan/Elevation",
     "author": "Luiz + Codex",
-    "version": (0, 3, 0),
+    "version": (0, 5, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Mesh Cut",
     "description": "Camera-based plan/elevation cuts for any mesh object with SVG/DXF export",
@@ -19,6 +19,8 @@ from bpy.types import Operator, Panel, PropertyGroup, UIList
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
+
+from .meshcut_accel import build_visibility_acceleration, cython_backend_available, visibility_mask
 from mathutils.geometry import intersect_line_plane
 
 _DRAW_HANDLE_VIEW = None
@@ -140,67 +142,108 @@ def _resolve_export_context(context: bpy.types.Context):
 def _create_performance_budget(settings):
     visible_only = bool(getattr(settings, "visible_only", True))
     fallback_visible = bool(getattr(settings, "budget_fallback_visible", True))
+    force_visible_on_limit = bool(getattr(settings, "ensure_finish_on_budget", True))
     return {
         "enabled": bool(getattr(settings, "performance_guard", False)),
         "max_ray_casts": int(getattr(settings, "max_ray_casts", 200000)),
         # "Visible Only (No X-Ray)" must never degrade to x-ray when guard limit is reached.
         "fallback_visible": fallback_visible and not visible_only,
+        "force_visible_on_limit": force_visible_on_limit,
         "ray_casts": 0,
         "limit_hit": False,
     }
 
 
-def _is_world_point_visible(scene, depsgraph, camera, point_world: Vector, epsilon: float = 1e-4, budget=None) -> bool:
-    if budget and budget["enabled"]:
-        if budget["ray_casts"] >= budget["max_ray_casts"]:
-            budget["limit_hit"] = True
-            return True if budget["fallback_visible"] else False
-        budget["ray_casts"] += 1
-
+def _ray_from_camera(camera, point_world: Vector, epsilon: float = 1e-4):
     if camera.data.type == "ORTHO":
         cam_inv = camera.matrix_world.inverted()
         p_cam = cam_inv @ point_world
         dist = -p_cam.z
         if dist <= epsilon:
-            return True
+            return None
 
         origin = camera.matrix_world @ Vector((p_cam.x, p_cam.y, 0.0))
         direction = camera.matrix_world.to_quaternion() @ Vector((0.0, 0.0, -1.0))
-    else:
-        origin = camera.matrix_world.translation
-        ray = point_world - origin
-        dist = ray.length
-        if dist <= epsilon:
-            return True
-        direction = ray / dist
+        return origin, direction, dist
 
-    hit, location, _normal, _index, _obj, _matrix = scene.ray_cast(depsgraph, origin, direction, distance=dist + epsilon)
-    if not hit:
+    origin = camera.matrix_world.translation
+    ray = point_world - origin
+    dist = ray.length
+    if dist <= epsilon:
+        return None
+    direction = ray / dist
+    return origin, direction, dist
+
+
+def _is_world_point_visible(scene, depsgraph, camera, point_world: Vector, epsilon: float = 1e-4, budget=None, accel=None) -> bool:
+    if budget and budget["enabled"]:
+        if budget["ray_casts"] >= budget["max_ray_casts"]:
+            budget["limit_hit"] = True
+            return True if (budget["fallback_visible"] or budget.get("force_visible_on_limit", False)) else False
+        budget["ray_casts"] += 1
+
+    ray_data = _ray_from_camera(camera, point_world, epsilon=epsilon)
+    if ray_data is None:
         return True
 
-    hit_dist = (location - origin).length
-    return hit_dist >= dist - epsilon
+    origin, direction, dist = ray_data
+    require_cython = bool(getattr(scene.meshcut_settings, "require_cython_backend", False))
+    return visibility_mask(scene, accel, [origin], [direction], [dist], epsilon=epsilon, require_cython=require_cython)[0]
 
 
-def _visible_intervals_on_segment(scene, depsgraph, camera, p1_world: Vector, p2_world: Vector, samples: int, budget=None):
-    if budget and budget["enabled"] and budget["limit_hit"] and budget["fallback_visible"]:
+def _visible_intervals_on_segment(scene, depsgraph, camera, p1_world: Vector, p2_world: Vector, samples: int, budget=None, accel=None):
+    if budget and budget["enabled"] and budget["limit_hit"] and (budget["fallback_visible"] or budget.get("force_visible_on_limit", False)):
         return [(0.0, 1.0)]
 
     samples = max(2, samples)
-    step = 1.0 / samples
-    vis_flags = []
 
-    for i in range(samples + 1):
-        t = i * step
-        vis_flags.append(_is_world_point_visible(scene, depsgraph, camera, p1_world.lerp(p2_world, t), budget=budget))
-        if budget and budget["enabled"] and budget["limit_hit"] and budget["fallback_visible"]:
-            return [(0.0, 1.0)]
+    if budget and budget["enabled"]:
+        remaining = budget["max_ray_casts"] - budget["ray_casts"]
+        if remaining <= 0:
+            budget["limit_hit"] = True
+            return [(0.0, 1.0)] if (budget["fallback_visible"] or budget.get("force_visible_on_limit", False)) else []
+
+        max_samples_by_budget = max(2, remaining - 1)
+        samples = min(samples, max_samples_by_budget)
+
+    step = 1.0 / samples
+    ts = [i * step for i in range(samples + 1)]
+
+    origins = []
+    directions = []
+    distances = []
+    valid_idx = []
+    vis_flags = [True] * (samples + 1)
+
+    for i, t in enumerate(ts):
+        ray_data = _ray_from_camera(camera, p1_world.lerp(p2_world, t))
+        if ray_data is None:
+            continue
+
+        origin, direction, dist = ray_data
+        origins.append(origin)
+        directions.append(direction)
+        distances.append(dist)
+        valid_idx.append(i)
+
+    if budget and budget["enabled"]:
+        budget["ray_casts"] += len(origins)
+        if budget["ray_casts"] >= budget["max_ray_casts"]:
+            budget["limit_hit"] = True
+
+    if origins:
+        require_cython = bool(getattr(scene.meshcut_settings, "require_cython_backend", False))
+        tested = visibility_mask(scene, accel, origins, directions, distances, require_cython=require_cython)
+        for i, visible in zip(valid_idx, tested):
+            vis_flags[i] = visible
+
+    if budget and budget["enabled"] and budget["limit_hit"] and (budget["fallback_visible"] or budget.get("force_visible_on_limit", False)):
+        return [(0.0, 1.0)]
 
     intervals = []
     t_start = None
-    for i in range(samples + 1):
-        visible = vis_flags[i]
-        t_cur = i * step
+    for i, visible in enumerate(vis_flags):
+        t_cur = ts[i]
         if visible and t_start is None:
             t_start = t_cur
         if (not visible or i == samples) and t_start is not None:
@@ -374,7 +417,7 @@ def _sync_annotation_points_from_objects(ann):
         if obj3 is not None:
             ann.p3 = obj3.matrix_world.translation
 
-def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin: float, dmax: float, budget=None):
+def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin: float, dmax: float, budget=None, accel=None):
     cam_inv = camera.matrix_world.inverted()
     world_lines = []
     world_texts = []
@@ -387,7 +430,7 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
         if ann.annotation_type == "TEXT":
             depth = _camera_depth(p1_cam)
             if dmin <= depth <= dmax:
-                if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, p1_world, budget=budget):
+                if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, p1_world, budget=budget, accel=accel):
                     world_texts.append((p1_world, ann.text.strip() or ann.name or "Note"))
             continue
 
@@ -410,7 +453,7 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
 
                 vis_parts = [(0.0, 1.0)]
                 if settings.visible_only:
-                    vis_parts = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget)
+                    vis_parts = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget, accel=accel)
 
                 for s0, s1 in vis_parts:
                     v1_world = c1_world.lerp(c2_world, s0)
@@ -424,7 +467,7 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
                 label_pos = _angle_label_position(p1_world, pivot_world, p3_world)
                 depth = _camera_depth(cam_inv @ label_pos)
                 if dmin <= depth <= dmax:
-                    if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, label_pos, budget=budget):
+                    if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, label_pos, budget=budget, accel=accel):
                         world_texts.append((label_pos, label))
             continue
 
@@ -440,7 +483,7 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
 
         vis_parts = [(0.0, 1.0)]
         if settings.visible_only:
-            vis_parts = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget)
+            vis_parts = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget, accel=accel)
 
         any_line = False
         for s0, s1 in vis_parts:
@@ -453,15 +496,15 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
         if any_line:
             label = ann.text.strip() or _format_length(scene, (c2_world - c1_world).length)
             mid_world = (c1_world + c2_world) * 0.5
-            if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, mid_world, budget=budget):
+            if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, mid_world, budget=budget, accel=accel):
                 world_texts.append((mid_world, label))
 
     return world_lines, world_texts
 
 
-def _collect_annotation_geometry(scene, depsgraph, camera, settings, dmin: float, dmax: float, budget=None):
+def _collect_annotation_geometry(scene, depsgraph, camera, settings, dmin: float, dmax: float, budget=None, accel=None):
     cam_inv = camera.matrix_world.inverted()
-    world_lines, world_texts = _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin, dmax, budget=budget)
+    world_lines, world_texts = _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin, dmax, budget=budget, accel=accel)
     anno_lines = []
     anno_texts = []
 
@@ -481,6 +524,11 @@ def _collect_segments(context: bpy.types.Context):
     if not camera or camera.type != "CAMERA":
         raise RuntimeError("Pick a valid camera in Mesh Cut > Camera.")
 
+    if settings.require_cython_backend and not cython_backend_available():
+        raise RuntimeError(
+            "Cython backend required: build meshcut_parallel with 'python setup.py build_ext --inplace' in /cython and copy binary beside __init__.py."
+        )
+
     if settings.use_selected_only:
         mesh_objects = [obj for obj in view_layer.objects if obj.type == "MESH" and obj.select_get(view_layer=view_layer)]
     else:
@@ -495,6 +543,7 @@ def _collect_segments(context: bpy.types.Context):
     segments = []
     points = []
     budget = _create_performance_budget(settings)
+    accel = build_visibility_acceleration(mesh_objects, depsgraph)
 
     dmin = min(settings.depth_near, settings.depth_far)
     dmax = max(settings.depth_near, settings.depth_far)
@@ -514,7 +563,7 @@ def _collect_segments(context: bpy.types.Context):
                 for p_cam, p_world in zip(cam_verts, world_verts):
                     depth = _camera_depth(p_cam)
                     if dmin <= depth <= dmax:
-                        if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, p_world, budget=budget):
+                        if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, p_world, budget=budget, accel=accel):
                             points.append(_project_point(camera, p_cam))
 
             for edge in mesh.edges:
@@ -537,7 +586,7 @@ def _collect_segments(context: bpy.types.Context):
                     segments.append((_project_point(camera, c1_cam), _project_point(camera, c2_cam)))
                     continue
 
-                intervals = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget)
+                intervals = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget, accel=accel)
                 for s0, s1 in intervals:
                     v1_cam = c1_cam.lerp(c2_cam, s0)
                     v2_cam = c1_cam.lerp(c2_cam, s1)
@@ -546,7 +595,7 @@ def _collect_segments(context: bpy.types.Context):
         finally:
             eval_obj.to_mesh_clear()
 
-    anno_lines, anno_texts = _collect_annotation_geometry(scene, depsgraph, camera, settings, dmin, dmax, budget=budget)
+    anno_lines, anno_texts = _collect_annotation_geometry(scene, depsgraph, camera, settings, dmin, dmax, budget=budget, accel=accel)
 
     if not segments and not points and not anno_lines and not anno_texts:
         raise RuntimeError("Nothing to export with current depth settings.")
@@ -573,7 +622,9 @@ def _draw_annotations_overlay_view():
     depsgraph = context.evaluated_depsgraph_get()
     dmin = min(settings.depth_near, settings.depth_far)
     dmax = max(settings.depth_near, settings.depth_far)
-    world_lines, _world_texts = _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin, dmax)
+    preview_meshes = [obj for obj in context.view_layer.objects if obj.type == "MESH" and obj.visible_get(view_layer=context.view_layer)]
+    accel = build_visibility_acceleration(preview_meshes, depsgraph)
+    world_lines, _world_texts = _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin, dmax, accel=accel)
 
     if not world_lines and not _DRAW_DIMENSION_PREVIEW["active"]:
         return
@@ -617,7 +668,9 @@ def _draw_annotations_overlay_text():
     depsgraph = context.evaluated_depsgraph_get()
     dmin = min(settings.depth_near, settings.depth_far)
     dmax = max(settings.depth_near, settings.depth_far)
-    _world_lines, world_texts = _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin, dmax)
+    preview_meshes = [obj for obj in context.view_layer.objects if obj.type == "MESH" and obj.visible_get(view_layer=context.view_layer)]
+    accel = build_visibility_acceleration(preview_meshes, depsgraph)
+    _world_lines, world_texts = _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin, dmax, accel=accel)
 
     font_id = 0
     blf.size(font_id, int(max(8, settings.viewport_text_size)))
@@ -806,9 +859,11 @@ class MESHCUT_PG_settings(PropertyGroup):
     use_selected_only: BoolProperty(name="Selected Only", description="Export only selected mesh objects", default=True)
     export_vertices: BoolProperty(name="Export Vertices", description="Include vertices as points in SVG and DXF", default=True)
     visible_only: BoolProperty(name="Visible Only (No X-Ray)", description="Cast rays from camera and keep only directly visible geometry", default=True)
+    require_cython_backend: BoolProperty(name="Require Cython Backend", description="Require compiled meshcut_parallel module for export", default=True)
     performance_guard: BoolProperty(name="Performance Guard", description="Limit ray-casts to avoid Blender freezes on heavy scenes", default=True)
     max_ray_casts: IntProperty(name="Max Ray Casts", description="Maximum visibility tests per export", default=150000, min=1000, max=10000000, soft_max=1000000)
     budget_fallback_visible: BoolProperty(name="Fallback To Visible", description="When limit is reached, keep remaining geometry visible instead of skipping (ignored when Visible Only is enabled)", default=False)
+    ensure_finish_on_budget: BoolProperty(name="Always Finish Export", description="When ray budget is exceeded, force remaining geometry visible so DXF/SVG still finishes", default=True)
     visibility_samples: IntProperty(
         name="Visibility Samples",
         description="Samples per edge for hidden-line filtering (higher = cleaner, slower)",
@@ -1034,7 +1089,7 @@ class MESHCUT_OT_export_svg(Operator):
                 settings.annotation_text_color,
             )
             if budget["enabled"] and budget["limit_hit"]:
-                mode = "fallback visibility" if budget["fallback_visible"] else "hidden remainder"
+                mode = "adaptive fallback visibility" if (budget["fallback_visible"] or budget.get("force_visible_on_limit", False)) else "hidden remainder"
                 self.report(
                     {"WARNING"},
                     f"Performance guard hit ({budget['ray_casts']} ray casts). Export mode: {mode}.",
@@ -1076,7 +1131,7 @@ class MESHCUT_OT_export_dxf(Operator):
                 settings.annotation_text_color,
             )
             if budget["enabled"] and budget["limit_hit"]:
-                mode = "fallback visibility" if budget["fallback_visible"] else "hidden remainder"
+                mode = "adaptive fallback visibility" if (budget["fallback_visible"] or budget.get("force_visible_on_limit", False)) else "hidden remainder"
                 self.report(
                     {"WARNING"},
                     f"Performance guard hit ({budget['ray_casts']} ray casts). Export mode: {mode}.",
@@ -1126,10 +1181,12 @@ class MESHCUT_PT_panel(Panel):
 
         col.separator(); col.label(text="Visibility")
         col.prop(settings, "visible_only")
+        col.prop(settings, "require_cython_backend")
         col.prop(settings, "performance_guard")
         if settings.performance_guard:
             col.prop(settings, "max_ray_casts")
             col.prop(settings, "budget_fallback_visible")
+            col.prop(settings, "ensure_finish_on_budget")
         col.prop(settings, "visibility_samples")
 
         col.separator(); col.label(text="Collection")
