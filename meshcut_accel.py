@@ -1,13 +1,9 @@
-"""Acceleration layer for MeshCut visibility tests.
-
-This module keeps the add-on runnable without compiled extensions, while
-optionally using a Cython extension for parallel ray checks.
-"""
+"""Acceleration layer for MeshCut visibility tests."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import bpy
 from mathutils import Vector
@@ -25,6 +21,19 @@ class VisibilityAcceleration:
     depsgraph: bpy.types.Depsgraph
     bvh: BVHTree | None
     tri_vertices: list[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]]
+
+
+def cython_backend_available() -> bool:
+    return _cy_parallel is not None
+
+
+def _cython_required_error() -> RuntimeError:
+    return RuntimeError(
+        "Cython backend is required, but meshcut_parallel is not available. "
+        "Build it with 'python -m pip install cython setuptools wheel', "
+        "then run 'python setup.py build_ext --inplace' inside the cython folder "
+        "and copy the generated meshcut_parallel binary next to __init__.py."
+    )
 
 
 def build_visibility_acceleration(mesh_objects: Iterable[bpy.types.Object], depsgraph: bpy.types.Depsgraph):
@@ -62,13 +71,25 @@ def build_visibility_acceleration(mesh_objects: Iterable[bpy.types.Object], deps
     return VisibilityAcceleration(depsgraph=depsgraph, bvh=bvh, tri_vertices=tri_vertices)
 
 
-def visibility_mask(scene, accel: VisibilityAcceleration | None, origins: list[Vector], directions: list[Vector], distances: list[float], epsilon: float = 1e-4):
+def visibility_mask(
+    scene,
+    accel: VisibilityAcceleration | None,
+    origins: Sequence[Vector],
+    directions: Sequence[Vector],
+    distances: Sequence[float],
+    epsilon: float = 1e-4,
+    require_cython: bool = False,
+):
     """Return a visibility boolean for each ray.
 
-    Uses Cython parallel kernel when available. Falls back to BVH ray_cast.
+    Uses Cython parallel kernel when available. Falls back to BVH ray_cast and,
+    as a last resort, Blender's scene.ray_cast.
     """
     if not origins:
         return []
+
+    if require_cython and not cython_backend_available():
+        raise _cython_required_error()
 
     if accel and accel.tri_vertices and _cy_parallel is not None:
         hit_distances = _cy_parallel.parallel_first_hit_distances(origins, directions, distances, accel.tri_vertices)

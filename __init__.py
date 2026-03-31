@@ -1,7 +1,7 @@
 ﻿bl_info = {
     "name": "Mesh Cut Plan/Elevation",
     "author": "Luiz + Codex",
-    "version": (0, 4, 0),
+    "version": (0, 5, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Mesh Cut",
     "description": "Camera-based plan/elevation cuts for any mesh object with SVG/DXF export",
@@ -20,7 +20,7 @@ from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 
-from .meshcut_accel import build_visibility_acceleration, visibility_mask
+from .meshcut_accel import build_visibility_acceleration, cython_backend_available, visibility_mask
 from mathutils.geometry import intersect_line_plane
 
 _DRAW_HANDLE_VIEW = None
@@ -145,11 +145,41 @@ def _create_performance_budget(settings):
     return {
         "enabled": bool(getattr(settings, "performance_guard", False)),
         "max_ray_casts": int(getattr(settings, "max_ray_casts", 200000)),
-        # "Visible Only (No X-Ray)" must never degrade to x-ray when guard limit is reached.
         "fallback_visible": fallback_visible and not visible_only,
+        "force_visible_on_limit": bool(getattr(settings, "ensure_finish_on_budget", True)),
+        "require_cython": bool(getattr(settings, "require_cython_backend", True)),
         "ray_casts": 0,
         "limit_hit": False,
     }
+
+
+def _budget_returns_visible(budget) -> bool:
+    return bool(budget and (budget.get("force_visible_on_limit") or budget.get("fallback_visible")))
+
+
+def _reserve_ray_budget(budget, requested: int) -> int:
+    if not budget or not budget["enabled"]:
+        return requested
+
+    remaining = budget["max_ray_casts"] - budget["ray_casts"]
+    if remaining <= 0:
+        budget["limit_hit"] = True
+        return 0
+
+    allowed = min(requested, remaining)
+    budget["ray_casts"] += allowed
+    if allowed < requested:
+        budget["limit_hit"] = True
+    return allowed
+
+
+def _cython_requirement_message() -> str:
+    return (
+        "Require Cython Backend is enabled, but meshcut_parallel is missing. "
+        "Build it with 'python -m pip install cython setuptools wheel' and "
+        "'python setup.py build_ext --inplace' inside the cython folder, then "
+        "copy the generated meshcut_parallel binary next to __init__.py."
+    )
 
 
 def _ray_from_camera(camera, point_world: Vector, epsilon: float = 1e-4):
@@ -174,42 +204,76 @@ def _ray_from_camera(camera, point_world: Vector, epsilon: float = 1e-4):
 
 
 def _is_world_point_visible(scene, depsgraph, camera, point_world: Vector, epsilon: float = 1e-4, budget=None, accel=None) -> bool:
-    if budget and budget["enabled"]:
-        if budget["ray_casts"] >= budget["max_ray_casts"]:
-            budget["limit_hit"] = True
-            return True if budget["fallback_visible"] else False
-        budget["ray_casts"] += 1
-
     ray_data = _ray_from_camera(camera, point_world, epsilon=epsilon)
     if ray_data is None:
         return True
 
+    allowed = _reserve_ray_budget(budget, 1)
+    if allowed <= 0:
+        return _budget_returns_visible(budget)
+
     origin, direction, dist = ray_data
-    return visibility_mask(scene, accel, [origin], [direction], [dist], epsilon=epsilon)[0]
+    return visibility_mask(
+        scene,
+        accel,
+        [origin],
+        [direction],
+        [dist],
+        epsilon=epsilon,
+        require_cython=bool(budget and budget.get("require_cython")),
+    )[0]
 
 
 def _visible_intervals_on_segment(scene, depsgraph, camera, p1_world: Vector, p2_world: Vector, samples: int, budget=None, accel=None):
-    if budget and budget["enabled"] and budget["limit_hit"] and budget["fallback_visible"]:
-        return [(0.0, 1.0)]
+    if budget and budget["enabled"] and budget["limit_hit"]:
+        return [(0.0, 1.0)] if _budget_returns_visible(budget) else []
 
     samples = max(2, samples)
-    step = 1.0 / samples
-    vis_flags = []
+    requested_rays = samples + 1
+    allowed_rays = _reserve_ray_budget(budget, requested_rays)
+    if allowed_rays <= 0:
+        return [(0.0, 1.0)] if _budget_returns_visible(budget) else []
+    if allowed_rays < 2:
+        return [(0.0, 1.0)] if _budget_returns_visible(budget) else []
 
-    for i in range(samples + 1):
+    step = 1.0 / (allowed_rays - 1)
+    vis_flags = [True] * allowed_rays
+    batched_indices = []
+    origins = []
+    directions = []
+    distances = []
+
+    for i in range(allowed_rays):
         t = i * step
-        vis_flags.append(_is_world_point_visible(scene, depsgraph, camera, p1_world.lerp(p2_world, t), budget=budget, accel=accel))
-        if budget and budget["enabled"] and budget["limit_hit"] and budget["fallback_visible"]:
-            return [(0.0, 1.0)]
+        ray_data = _ray_from_camera(camera, p1_world.lerp(p2_world, t))
+        if ray_data is None:
+            continue
+        origin, direction, dist = ray_data
+        batched_indices.append(i)
+        origins.append(origin)
+        directions.append(direction)
+        distances.append(dist)
+
+    if origins:
+        batched_visibility = visibility_mask(
+            scene,
+            accel,
+            origins,
+            directions,
+            distances,
+            require_cython=bool(budget and budget.get("require_cython")),
+        )
+        for idx, visible in zip(batched_indices, batched_visibility):
+            vis_flags[idx] = visible
 
     intervals = []
     t_start = None
-    for i in range(samples + 1):
+    for i in range(allowed_rays):
         visible = vis_flags[i]
         t_cur = i * step
         if visible and t_start is None:
             t_start = t_cur
-        if (not visible or i == samples) and t_start is not None:
+        if (not visible or i == allowed_rays - 1) and t_start is not None:
             t_end = t_cur if visible else max(0.0, t_cur - step)
             if t_end > t_start:
                 intervals.append((t_start, t_end))
@@ -501,6 +565,8 @@ def _collect_segments(context: bpy.types.Context):
     segments = []
     points = []
     budget = _create_performance_budget(settings)
+    if budget["require_cython"] and not cython_backend_available():
+        raise RuntimeError(_cython_requirement_message())
     accel = build_visibility_acceleration(mesh_objects, depsgraph)
 
     dmin = min(settings.depth_near, settings.depth_far)
@@ -819,6 +885,8 @@ class MESHCUT_PG_settings(PropertyGroup):
     visible_only: BoolProperty(name="Visible Only (No X-Ray)", description="Cast rays from camera and keep only directly visible geometry", default=True)
     performance_guard: BoolProperty(name="Performance Guard", description="Limit ray-casts to avoid Blender freezes on heavy scenes", default=True)
     max_ray_casts: IntProperty(name="Max Ray Casts", description="Maximum visibility tests per export", default=150000, min=1000, max=10000000, soft_max=1000000)
+    require_cython_backend: BoolProperty(name="Require Cython Backend", description="Fail export unless the compiled meshcut_parallel backend is available", default=True)
+    ensure_finish_on_budget: BoolProperty(name="Always Finish Export", description="When the ray budget is exhausted, keep the remaining geometry visible so DXF/SVG export still completes", default=True)
     budget_fallback_visible: BoolProperty(name="Fallback To Visible", description="When limit is reached, keep remaining geometry visible instead of skipping (ignored when Visible Only is enabled)", default=False)
     visibility_samples: IntProperty(
         name="Visibility Samples",
@@ -1045,7 +1113,12 @@ class MESHCUT_OT_export_svg(Operator):
                 settings.annotation_text_color,
             )
             if budget["enabled"] and budget["limit_hit"]:
-                mode = "fallback visibility" if budget["fallback_visible"] else "hidden remainder"
+                if budget["force_visible_on_limit"]:
+                    mode = "always finish export"
+                elif budget["fallback_visible"]:
+                    mode = "fallback visibility"
+                else:
+                    mode = "hidden remainder"
                 self.report(
                     {"WARNING"},
                     f"Performance guard hit ({budget['ray_casts']} ray casts). Export mode: {mode}.",
@@ -1087,7 +1160,12 @@ class MESHCUT_OT_export_dxf(Operator):
                 settings.annotation_text_color,
             )
             if budget["enabled"] and budget["limit_hit"]:
-                mode = "fallback visibility" if budget["fallback_visible"] else "hidden remainder"
+                if budget["force_visible_on_limit"]:
+                    mode = "always finish export"
+                elif budget["fallback_visible"]:
+                    mode = "fallback visibility"
+                else:
+                    mode = "hidden remainder"
                 self.report(
                     {"WARNING"},
                     f"Performance guard hit ({budget['ray_casts']} ray casts). Export mode: {mode}.",
@@ -1137,9 +1215,13 @@ class MESHCUT_PT_panel(Panel):
 
         col.separator(); col.label(text="Visibility")
         col.prop(settings, "visible_only")
+        col.prop(settings, "require_cython_backend")
+        status_text = "Compiled backend: available" if cython_backend_available() else "Compiled backend: missing"
+        col.label(text=status_text, icon="CHECKMARK" if cython_backend_available() else "ERROR")
         col.prop(settings, "performance_guard")
         if settings.performance_guard:
             col.prop(settings, "max_ray_casts")
+            col.prop(settings, "ensure_finish_on_budget")
             col.prop(settings, "budget_fallback_visible")
         col.prop(settings, "visibility_samples")
 
