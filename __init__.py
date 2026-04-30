@@ -508,6 +508,329 @@ def _color_to_dxf_truecolor(color) -> int:
     return (r << 16) | (g << 8) | b
 
 
+def _dxf_layer_name(name: str, fallback: str = "MESH") -> str:
+    safe = "".join(c.upper() if c.isalnum() else "_" for c in (name or fallback))
+    parts = [part for part in safe.split("_") if part]
+    return "_".join(parts)[:255] or fallback
+
+
+def _object_class_name(obj: bpy.types.Object) -> str:
+    name = obj.name or "MESH"
+    normalized = _dxf_layer_name(name, fallback="MESH")
+    keywords = {
+        "PAREDE": "PAREDE",
+        "WALL": "PAREDE",
+        "PROJETOR": "PROJETOR",
+        "PROJETRO": "PROJETOR",
+        "PROJETO": "PROJETOR",
+    }
+    for keyword, layer in keywords.items():
+        if keyword in normalized:
+            return layer
+
+    base = name.split(".")[0]
+    for separator in ("_", "-", " "):
+        if separator in base:
+            base = base.split(separator)[0]
+            break
+    return _dxf_layer_name(base, fallback="MESH")
+
+
+def _object_projection_layer(obj: bpy.types.Object) -> str:
+    return _object_class_name(obj)
+
+
+def _object_section_layer(obj: bpy.types.Object) -> str:
+    return f"{_object_class_name(obj)}_CORTE"
+
+
+def _object_hatch_layer(obj: bpy.types.Object) -> str:
+    return f"{_object_class_name(obj)}_HACHURA"
+
+
+def _make_line(p1, p2, layer: str = "0", kind: str = "LINE"):
+    return {"p1": p1, "p2": p2, "layer": _dxf_layer_name(layer, fallback="0"), "kind": kind}
+
+
+def _make_point(point, layer: str = "0"):
+    return {"point": point, "layer": _dxf_layer_name(layer, fallback="0")}
+
+
+def _line_points(line):
+    if isinstance(line, dict):
+        return line["p1"], line["p2"]
+    return line
+
+
+def _point_xy(point):
+    if isinstance(point, dict):
+        return point["point"]
+    return point
+
+
+def _line_layer(line, fallback: str = "0") -> str:
+    if isinstance(line, dict):
+        return _dxf_layer_name(line.get("layer", fallback), fallback=fallback)
+    return fallback
+
+
+def _point_layer(point, fallback: str = "0") -> str:
+    if isinstance(point, dict):
+        return _dxf_layer_name(point.get("layer", fallback), fallback=fallback)
+    return fallback
+
+
+def _dedupe_points(points, epsilon: float = 1e-7):
+    unique = []
+    for point in points:
+        if not any((point - existing).length <= epsilon for existing in unique):
+            unique.append(point)
+    return unique
+
+
+def _triangle_section_segment(world_tri, cam_tri, cut_depth: float, epsilon: float = 1e-7):
+    points = []
+    depths = [_camera_depth(p_cam) for p_cam in cam_tri]
+    offsets = [depth - cut_depth for depth in depths]
+
+    if all(abs(offset) <= epsilon for offset in offsets):
+        return None
+
+    for index in range(3):
+        next_index = (index + 1) % 3
+        d1 = offsets[index]
+        d2 = offsets[next_index]
+        w1 = world_tri[index]
+        w2 = world_tri[next_index]
+
+        if abs(d1) <= epsilon:
+            points.append(w1)
+        if d1 * d2 < 0.0:
+            t = abs(d1) / (abs(d1) + abs(d2))
+            points.append(w1.lerp(w2, t))
+        elif abs(d2) <= epsilon:
+            points.append(w2)
+
+    unique = _dedupe_points(points, epsilon=epsilon)
+    if len(unique) < 2:
+        return None
+    return unique[0], unique[1]
+
+
+def _snap_xy(point, precision: float = 1e-5):
+    return (round(point[0] / precision), round(point[1] / precision))
+
+
+def _loop_area(loop) -> float:
+    area = 0.0
+    for index, p1 in enumerate(loop):
+        p2 = loop[(index + 1) % len(loop)]
+        area += (p1[0] * p2[1]) - (p2[0] * p1[1])
+    return area * 0.5
+
+
+def _build_closed_loops_2d(segments, precision: float = 1e-5):
+    adjacency = {}
+    coords = {}
+    edges = set()
+
+    for p1, p2 in segments:
+        k1 = _snap_xy(p1, precision)
+        k2 = _snap_xy(p2, precision)
+        if k1 == k2:
+            continue
+        edge = tuple(sorted((k1, k2)))
+        if edge in edges:
+            continue
+        edges.add(edge)
+        coords[k1] = p1
+        coords[k2] = p2
+        adjacency.setdefault(k1, []).append(k2)
+        adjacency.setdefault(k2, []).append(k1)
+
+    for key, neighbors in adjacency.items():
+        neighbors.sort(key=lambda other: math.atan2(coords[other][1] - coords[key][1], coords[other][0] - coords[key][0]))
+
+    visited_directed = set()
+    loops = []
+
+    for start in adjacency:
+        for neighbor in adjacency[start]:
+            if (start, neighbor) in visited_directed:
+                continue
+
+            loop_keys = [start]
+            start_edge = (start, neighbor)
+            cur = start
+            nxt = neighbor
+
+            while True:
+                visited_directed.add((cur, nxt))
+                prev, cur = cur, nxt
+                if cur == start:
+                    break
+                loop_keys.append(cur)
+
+                candidates = [candidate for candidate in adjacency.get(cur, []) if candidate != prev]
+                if not candidates:
+                    break
+
+                incoming_angle = math.atan2(coords[prev][1] - coords[cur][1], coords[prev][0] - coords[cur][0])
+                nxt = min(candidates, key=lambda candidate: (math.atan2(coords[candidate][1] - coords[cur][1], coords[candidate][0] - coords[cur][0]) - incoming_angle) % (math.pi * 2.0))
+
+                if (cur, nxt) == start_edge or len(loop_keys) > len(adjacency) + 1:
+                    break
+
+            if cur == start and len(loop_keys) >= 3:
+                loop = [coords[key] for key in loop_keys]
+                if abs(_loop_area(loop)) > precision:
+                    loops.append(loop)
+
+    unique_loops = []
+    seen = set()
+    for loop in loops:
+        keys = tuple(sorted(_snap_xy(point, precision) for point in loop))
+        if keys in seen:
+            continue
+        seen.add(keys)
+        unique_loops.append(loop)
+
+    return unique_loops
+
+
+def _rotate_xy(point, cos_a: float, sin_a: float):
+    x, y = point
+    return (x * cos_a - y * sin_a, x * sin_a + y * cos_a)
+
+
+def _hatch_loop(loop, spacing: float, angle_degrees: float):
+    if len(loop) < 3:
+        return []
+
+    angle = math.radians(angle_degrees)
+    cos_a = math.cos(-angle)
+    sin_a = math.sin(-angle)
+    inv_cos = math.cos(angle)
+    inv_sin = math.sin(angle)
+    rotated = [_rotate_xy(point, cos_a, sin_a) for point in loop]
+    ys = [point[1] for point in rotated]
+    min_y = min(ys)
+    max_y = max(ys)
+    spacing = max(0.001, spacing)
+    hatch_segments = []
+    usable_height = max_y - min_y
+    if usable_height <= 1e-9:
+        return []
+
+    if usable_height < spacing:
+        hatch_rows = [(min_y + max_y) * 0.5]
+    else:
+        y = math.ceil((min_y + 1e-9) / spacing) * spacing
+        if y >= max_y - 1e-9:
+            y = (min_y + max_y) * 0.5
+        hatch_rows = []
+        while y < max_y - 1e-9:
+            hatch_rows.append(y)
+            y += spacing
+        if not hatch_rows:
+            hatch_rows.append((min_y + max_y) * 0.5)
+
+    for y in hatch_rows:
+        intersections = []
+        for index, p1 in enumerate(rotated):
+            p2 = rotated[(index + 1) % len(rotated)]
+            x1, y1 = p1
+            x2, y2 = p2
+            if math.isclose(y1, y2):
+                continue
+            if (y1 <= y < y2) or (y2 <= y < y1):
+                t = (y - y1) / (y2 - y1)
+                intersections.append(x1 + ((x2 - x1) * t))
+
+        intersections.sort()
+        for index in range(0, len(intersections) - 1, 2):
+            p1 = _rotate_xy((intersections[index], y), inv_cos, inv_sin)
+            p2 = _rotate_xy((intersections[index + 1], y), inv_cos, inv_sin)
+            if math.dist(p1, p2) > 1e-8:
+                hatch_segments.append((p1, p2))
+
+    return hatch_segments
+
+
+def _hatch_segments_from_section(section_segments, spacing: float, angle_degrees: float):
+    hatch_segments = []
+    if not section_segments:
+        return hatch_segments
+
+    angle = math.radians(angle_degrees)
+    cos_a = math.cos(-angle)
+    sin_a = math.sin(-angle)
+    inv_cos = math.cos(angle)
+    inv_sin = math.sin(angle)
+    rotated_segments = [(_rotate_xy(p1, cos_a, sin_a), _rotate_xy(p2, cos_a, sin_a)) for p1, p2 in section_segments]
+    ys = [point[1] for segment in rotated_segments for point in segment]
+    min_y = min(ys)
+    max_y = max(ys)
+    spacing = max(0.001, spacing)
+    usable_height = max_y - min_y
+    if usable_height <= 1e-9:
+        return hatch_segments
+
+    if usable_height < spacing:
+        hatch_rows = [(min_y + max_y) * 0.5]
+    else:
+        y = math.ceil((min_y + 1e-9) / spacing) * spacing
+        if y >= max_y - 1e-9:
+            y = (min_y + max_y) * 0.5
+        hatch_rows = []
+        while y < max_y - 1e-9:
+            hatch_rows.append(y)
+            y += spacing
+        if not hatch_rows:
+            hatch_rows.append((min_y + max_y) * 0.5)
+
+    for y in hatch_rows:
+        intersections = []
+        for p1, p2 in rotated_segments:
+            x1, y1 = p1
+            x2, y2 = p2
+            if math.isclose(y1, y2):
+                continue
+            if (y1 <= y < y2) or (y2 <= y < y1):
+                t = (y - y1) / (y2 - y1)
+                intersections.append(x1 + ((x2 - x1) * t))
+
+        intersections.sort()
+        deduped = []
+        for value in intersections:
+            if not deduped or abs(value - deduped[-1]) > 1e-6:
+                deduped.append(value)
+
+        for index in range(0, len(deduped) - 1, 2):
+            p1 = _rotate_xy((deduped[index], y), inv_cos, inv_sin)
+            p2 = _rotate_xy((deduped[index + 1], y), inv_cos, inv_sin)
+            if math.dist(p1, p2) > 1e-8:
+                hatch_segments.append((p1, p2))
+
+    if not hatch_segments:
+        for loop in _build_closed_loops_2d(section_segments):
+            hatch_segments.extend(_hatch_loop(loop, spacing, angle_degrees))
+    return hatch_segments
+
+
+def _section_depths_for_object(cam_verts, dmin: float, dmax: float, epsilon: float = 1e-7):
+    if not cam_verts:
+        return []
+    depths = [_camera_depth(point) for point in cam_verts]
+    obj_min = min(depths)
+    obj_max = max(depths)
+    cut_depths = []
+    for depth in (dmin, dmax):
+        if obj_min + epsilon < depth < obj_max - epsilon and not any(abs(depth - existing) <= epsilon for existing in cut_depths):
+            cut_depths.append(depth)
+    return cut_depths
+
+
 def _sync_annotation_points_from_objects(ann):
     if ann.p1_object_name:
         obj1 = bpy.data.objects.get(ann.p1_object_name)
@@ -700,18 +1023,44 @@ def _collect_segments(context: bpy.types.Context, progress=None):
 
         try:
             _update_mesh_progress(f"Tracing object: {obj.name}", force=True)
+            projection_layer = _object_projection_layer(obj)
+            section_layer = _object_section_layer(obj)
+            hatch_layer = _object_hatch_layer(obj)
             world_mat = eval_obj.matrix_world
             world_verts = [world_mat @ v.co for v in mesh.vertices]
             cam_verts = [cam_inv @ p for p in world_verts]
             vertex_count = len(world_verts) if settings.export_vertices else 0
             edge_count = len(mesh.edges)
 
+            if settings.export_section_cuts:
+                mesh.calc_loop_triangles()
+                for cut_depth in _section_depths_for_object(cam_verts, dmin, dmax):
+                    object_section_segments = []
+                    for tri in mesh.loop_triangles:
+                        tri_indices = tri.vertices
+                        world_tri = [world_verts[index] for index in tri_indices]
+                        cam_tri = [cam_verts[index] for index in tri_indices]
+                        section = _triangle_section_segment(world_tri, cam_tri, cut_depth)
+                        if section is None:
+                            continue
+                        p1_world, p2_world = section
+                        if (p2_world - p1_world).length <= 1e-8:
+                            continue
+                        p1_2d = _project_point(camera, cam_inv @ p1_world)
+                        p2_2d = _project_point(camera, cam_inv @ p2_world)
+                        object_section_segments.append((p1_2d, p2_2d))
+                        segments.append(_make_line(p1_2d, p2_2d, section_layer, kind="SECTION"))
+
+                    if settings.export_cut_hatches and object_section_segments:
+                        for hatch_p1, hatch_p2 in _hatch_segments_from_section(object_section_segments, settings.hatch_spacing, settings.hatch_angle):
+                            segments.append(_make_line(hatch_p1, hatch_p2, hatch_layer, kind="HATCH"))
+
             if settings.export_vertices:
                 for vertex_index, (p_cam, p_world) in enumerate(zip(cam_verts, world_verts), start=1):
                     depth = _camera_depth(p_cam)
                     if dmin <= depth <= dmax:
                         if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, p_world, budget=budget, accel=accel):
-                            points.append(_project_point(camera, p_cam))
+                            points.append(_make_point(_project_point(camera, p_cam), projection_layer))
                     if (vertex_index % 512) == 0:
                         _update_mesh_progress(f"Tracing vertices: {obj.name}", local_done=vertex_index)
                 mesh_work_done += len(world_verts)
@@ -733,7 +1082,7 @@ def _collect_segments(context: bpy.types.Context, progress=None):
                 c2_world = p1_world.lerp(p2_world, t1)
 
                 if not settings.visible_only:
-                    segments.append((_project_point(camera, c1_cam), _project_point(camera, c2_cam)))
+                    segments.append(_make_line(_project_point(camera, c1_cam), _project_point(camera, c2_cam), projection_layer, kind="PROJECTION"))
                     continue
 
                 intervals = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget, accel=accel)
@@ -741,7 +1090,7 @@ def _collect_segments(context: bpy.types.Context, progress=None):
                     v1_cam = c1_cam.lerp(c2_cam, s0)
                     v2_cam = c1_cam.lerp(c2_cam, s1)
                     if (v2_cam - v1_cam).length > 1e-8:
-                        segments.append((_project_point(camera, v1_cam), _project_point(camera, v2_cam)))
+                        segments.append(_make_line(_project_point(camera, v1_cam), _project_point(camera, v2_cam), projection_layer, kind="PROJECTION"))
                 if (edge_index % 256) == 0:
                     _update_mesh_progress(f"Tracing edges: {obj.name}", local_done=vertex_count + edge_index)
         finally:
@@ -870,15 +1219,18 @@ def _bounds_2d(segments, points, anno_lines, anno_texts):
     xs = []
     ys = []
 
-    for (x1, y1), (x2, y2) in segments:
+    for line in segments:
+        (x1, y1), (x2, y2) = _line_points(line)
         xs.extend((x1, x2))
         ys.extend((y1, y2))
 
-    for (x1, y1), (x2, y2) in anno_lines:
+    for line in anno_lines:
+        (x1, y1), (x2, y2) = _line_points(line)
         xs.extend((x1, x2))
         ys.extend((y1, y2))
 
-    for x, y in points:
+    for point in points:
+        x, y = _point_xy(point)
         xs.append(x)
         ys.append(y)
 
@@ -917,7 +1269,8 @@ def _write_svg(filepath: str, segments, points, anno_lines, anno_texts, scale: f
     lines.append(f'<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="{width:.4f}" height="{height:.4f}" viewBox="0 0 {width:.4f} {height:.4f}">')
     lines.append('<g stroke="black" fill="none" stroke-width="1">')
 
-    for (x1, y1), (x2, y2) in segments:
+    for line in segments:
+        (x1, y1), (x2, y2) = _line_points(line)
         sx1, sy1 = map_xy(x1, y1)
         sx2, sy2 = map_xy(x2, y2)
         lines.append(f'<line x1="{sx1:.4f}" y1="{sy1:.4f}" x2="{sx2:.4f}" y2="{sy2:.4f}" />')
@@ -926,7 +1279,8 @@ def _write_svg(filepath: str, segments, points, anno_lines, anno_texts, scale: f
 
     if points:
         lines.append('<g fill="red" stroke="none">')
-        for x, y in points:
+        for point in points:
+            x, y = _point_xy(point)
             sx, sy = map_xy(x, y)
             lines.append(f'<circle cx="{sx:.4f}" cy="{sy:.4f}" r="1.5" />')
         lines.append("</g>")
@@ -935,7 +1289,8 @@ def _write_svg(filepath: str, segments, points, anno_lines, anno_texts, scale: f
         stroke = _color_to_svg(anno_line_color)
         stroke_opacity = max(0.0, min(1.0, float(anno_line_color[3])))
         lines.append(f'<g stroke="{stroke}" stroke-opacity="{stroke_opacity:.4f}" fill="none" stroke-width="1.2">')
-        for (x1, y1), (x2, y2) in anno_lines:
+        for line in anno_lines:
+            (x1, y1), (x2, y2) = _line_points(line)
             sx1, sy1 = map_xy(x1, y1)
             sx2, sy2 = map_xy(x2, y2)
             lines.append(f'<line x1="{sx1:.4f}" y1="{sy1:.4f}" x2="{sx2:.4f}" y2="{sy2:.4f}" />')
@@ -954,19 +1309,39 @@ def _write_svg(filepath: str, segments, points, anno_lines, anno_texts, scale: f
     lines.append("</svg>")
     Path(filepath).write_text("\n".join(lines), encoding="utf-8")
 
+def _collect_dxf_layers(segments, points, anno_lines, anno_texts):
+    layers = {"0", "ANNOTATIONS"}
+    for line in segments:
+        layers.add(_line_layer(line))
+    for point in points:
+        layers.add(_point_layer(point))
+    for _line in anno_lines:
+        layers.add("ANNOTATIONS")
+    for _text in anno_texts:
+        layers.add("ANNOTATIONS")
+    return sorted(layers)
+
+
 def _write_dxf(filepath: str, segments, points, anno_lines, anno_texts, text_height: float, anno_line_color, anno_text_color):
-    lines = ["0", "SECTION", "2", "HEADER", "0", "ENDSEC", "0", "SECTION", "2", "TABLES", "0", "ENDSEC", "0", "SECTION", "2", "ENTITIES"]
+    dxf_layers = _collect_dxf_layers(segments, points, anno_lines, anno_texts)
+    lines = ["0", "SECTION", "2", "HEADER", "0", "ENDSEC", "0", "SECTION", "2", "TABLES", "0", "TABLE", "2", "LAYER", "70", str(len(dxf_layers))]
+    for layer in dxf_layers:
+        lines.extend(["0", "LAYER", "2", layer, "70", "0", "62", "7", "6", "CONTINUOUS"])
+    lines.extend(["0", "ENDTAB", "0", "ENDSEC", "0", "SECTION", "2", "ENTITIES"])
     line_truecolor = str(_color_to_dxf_truecolor(anno_line_color))
     text_truecolor = str(_color_to_dxf_truecolor(anno_text_color))
 
-    for (x1, y1), (x2, y2) in segments:
-        lines.extend(["0", "LINE", "8", "0", "10", f"{x1:.6f}", "20", f"{y1:.6f}", "30", "0.0", "11", f"{x2:.6f}", "21", f"{y2:.6f}", "31", "0.0"])
+    for line in segments:
+        (x1, y1), (x2, y2) = _line_points(line)
+        lines.extend(["0", "LINE", "8", _line_layer(line), "10", f"{x1:.6f}", "20", f"{y1:.6f}", "30", "0.0", "11", f"{x2:.6f}", "21", f"{y2:.6f}", "31", "0.0"])
 
-    for (x1, y1), (x2, y2) in anno_lines:
+    for line in anno_lines:
+        (x1, y1), (x2, y2) = _line_points(line)
         lines.extend(["0", "LINE", "8", "ANNOTATIONS", "420", line_truecolor, "10", f"{x1:.6f}", "20", f"{y1:.6f}", "30", "0.0", "11", f"{x2:.6f}", "21", f"{y2:.6f}", "31", "0.0"])
 
-    for x, y in points:
-        lines.extend(["0", "POINT", "8", "0", "10", f"{x:.6f}", "20", f"{y:.6f}", "30", "0.0"])
+    for point in points:
+        x, y = _point_xy(point)
+        lines.extend(["0", "POINT", "8", _point_layer(point), "10", f"{x:.6f}", "20", f"{y:.6f}", "30", "0.0"])
 
     for (x, y), txt in anno_texts:
         lines.extend(["0", "TEXT", "8", "ANNOTATIONS", "420", text_truecolor, "10", f"{x:.6f}", "20", f"{y:.6f}", "30", "0.0", "40", f"{text_height:.6f}", "1", txt])
@@ -1047,6 +1422,10 @@ class MESHCUT_PG_settings(PropertyGroup):
     show_depth_overlay: BoolProperty(name="Show Near/Far Overlay", description="Draw depth range box in viewport", default=True, update=_update_redraw)
     depth_near: FloatProperty(name="Depth Near", description="Minimum depth from camera", default=0.0, min=0.0, soft_max=1000.0, update=_update_redraw)
     depth_far: FloatProperty(name="Depth Far", description="Maximum depth from camera", default=100.0, min=0.0, soft_max=1000.0, update=_update_redraw)
+    export_section_cuts: BoolProperty(name="Export Cut Edges", description="Create real section lines where mesh faces cross the near cut plane", default=True)
+    export_cut_hatches: BoolProperty(name="Export Cut Hatches", description="Create hatch lines inside closed section contours", default=True)
+    hatch_spacing: FloatProperty(name="Hatch Spacing", description="Distance between generated hatch lines in DXF/SVG units", default=0.25, min=0.001, soft_max=100.0)
+    hatch_angle: FloatProperty(name="Hatch Angle", description="Hatch angle in degrees", default=45.0, min=-180.0, max=180.0)
     svg_scale: FloatProperty(name="SVG Scale", description="SVG scale", default=100.0, min=0.001, soft_max=10000.0)
     svg_margin: FloatProperty(name="SVG Margin", description="SVG margin", default=20.0, min=0.0, soft_max=1000.0)
     svg_text_size: FloatProperty(name="SVG Text Size", description="Text size in SVG pixels", default=12.0, min=1.0, soft_max=200.0)
@@ -1372,6 +1751,12 @@ class MESHCUT_PT_panel(Panel):
         col.prop(settings, "show_depth_overlay")
         col.prop(settings, "depth_near")
         col.prop(settings, "depth_far")
+        col.prop(settings, "export_section_cuts")
+        if settings.export_section_cuts:
+            col.prop(settings, "export_cut_hatches")
+            if settings.export_cut_hatches:
+                col.prop(settings, "hatch_spacing")
+                col.prop(settings, "hatch_angle")
 
         col.separator(); col.label(text="Visibility")
         col.prop(settings, "visible_only")

@@ -55,6 +55,24 @@ The Visibility panel exposes the key runtime controls:
 - `Fallback To Visible`: optional non-destructive fallback mode when the guard is hit outside the strict visible-only flow.
 - `Visibility Samples`: edge sampling density for hidden-line filtering.
 
+The Depth Filter panel also controls section output:
+
+- `Export Cut Edges`: creates real section lines from mesh faces crossing the near cut plane instead of relying only on existing mesh edges.
+- `Export Cut Hatches`: creates hatch linework inside closed section contours.
+- `Hatch Spacing`: distance between hatch lines.
+- `Hatch Angle`: hatch direction in degrees.
+
+## DXF Layers
+
+DXF export now writes entities to layers derived from object class names:
+
+- projection edges and points: `<CLASS>`
+- generated section lines: `<CLASS>_CORTE`
+- generated hatch lines: `<CLASS>_HACHURA`
+- annotation entities: `ANNOTATIONS`
+
+The exporter detects common object-name keywords such as `parede`, `wall`, `projetor`, `projetro`, and `projeto`. If no known keyword exists, it uses the first object-name token before `.`, `_`, `-`, or a space.
+
 ## Recommended Production Preset
 
 For the fastest and safest full export workflow:
