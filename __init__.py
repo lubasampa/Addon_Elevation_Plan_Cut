@@ -1,7 +1,7 @@
 ﻿bl_info = {
     "name": "Mesh Cut Plan/Elevation",
     "author": "Luiz + Codex",
-    "version": (0, 5, 0),
+    "version": (2026, 4, 30),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Mesh Cut",
     "description": "Camera-based plan/elevation cuts for any mesh object with SVG/DXF export",

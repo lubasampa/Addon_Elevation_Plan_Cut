@@ -2,6 +2,8 @@
 
 Blender add-on for plan, section, and elevation line extraction with SVG and DXF export.
 
+Current release: `v2026.04.30`.
+
 ## Architecture
 
 - `__init__.py`: main add-on entrypoint, UI, export flow, annotation tools, and visibility integration.
