@@ -498,6 +498,10 @@ def _constrain_dimension_point(p1: Vector, p2: Vector, mode: str, camera: bpy.ty
 
 
 def _mouse_to_camera_cut_plane(context: bpy.types.Context, event, camera: bpy.types.Object, settings):
+    snap_point = _mouse_to_viewport_snap(context, event)
+    if snap_point is not None:
+        return _project_world_to_camera_cut_plane(snap_point, camera, settings)
+
     region = context.region
     if context.area is not None:
         window_regions = [reg for reg in context.area.regions if reg.type == "WINDOW"]
@@ -516,6 +520,117 @@ def _mouse_to_camera_cut_plane(context: bpy.types.Context, event, camera: bpy.ty
     if hit is None:
         return None
     return hit
+
+
+def _viewport_event_data(context: bpy.types.Context, event):
+    region = context.region
+    if context.area is not None:
+        window_regions = [reg for reg in context.area.regions if reg.type == "WINDOW"]
+        if window_regions:
+            region = window_regions[0]
+    rv3d = context.region_data
+    if region is None or rv3d is None:
+        return None, None, None
+
+    return region, rv3d, Vector((event.mouse_x - region.x, event.mouse_y - region.y))
+
+
+def _screen_distance_sq(region, rv3d, point: Vector, coord: Vector):
+    p2d = view3d_utils.location_3d_to_region_2d(region, rv3d, point)
+    if p2d is None:
+        return None
+    return (p2d - coord).length_squared
+
+
+def _closest_screen_point_on_segment(region, rv3d, p1: Vector, p2: Vector, coord: Vector):
+    s1 = view3d_utils.location_3d_to_region_2d(region, rv3d, p1)
+    s2 = view3d_utils.location_3d_to_region_2d(region, rv3d, p2)
+    if s1 is None or s2 is None:
+        return None, None
+
+    segment = s2 - s1
+    length_sq = segment.length_squared
+    if length_sq <= 1e-9:
+        return p1, (s1 - coord).length_squared
+
+    t = max(0.0, min(1.0, (coord - s1).dot(segment) / length_sq))
+    return p1.lerp(p2, t), (s1.lerp(s2, t) - coord).length_squared
+
+
+def _snap_elements_enabled(context: bpy.types.Context) -> set[str]:
+    tool_settings = getattr(context.scene, "tool_settings", None)
+    if tool_settings is None or not getattr(tool_settings, "use_snap", False):
+        return set()
+
+    elements = set(getattr(tool_settings, "snap_elements", set()) or set())
+    if not elements:
+        return {"VERTEX", "EDGE", "FACE"}
+    return elements
+
+
+def _mouse_to_viewport_snap(context: bpy.types.Context, event):
+    region, rv3d, coord = _viewport_event_data(context, event)
+    if region is None or rv3d is None:
+        return None
+
+    snap_elements = _snap_elements_enabled(context)
+    snap_enabled = bool(snap_elements)
+    threshold_px = 14.0 if snap_enabled else 8.0
+    best_point = None
+    best_dist_sq = threshold_px * threshold_px
+
+    if snap_enabled and ({"VERTEX", "EDGE", "EDGE_MIDPOINT", "EDGE_PERPENDICULAR"} & snap_elements):
+        depsgraph = context.evaluated_depsgraph_get()
+        for obj in context.view_layer.objects:
+            if obj.type != "MESH" or not obj.visible_get(view_layer=context.view_layer):
+                continue
+
+            eval_obj = obj.evaluated_get(depsgraph)
+            mesh = eval_obj.to_mesh()
+            if mesh is None:
+                continue
+            try:
+                matrix = eval_obj.matrix_world
+                if "VERTEX" in snap_elements:
+                    for vertex in mesh.vertices:
+                        point = matrix @ vertex.co
+                        dist_sq = _screen_distance_sq(region, rv3d, point, coord)
+                        if dist_sq is not None and dist_sq < best_dist_sq:
+                            best_point = point
+                            best_dist_sq = dist_sq
+
+                if {"EDGE", "EDGE_MIDPOINT", "EDGE_PERPENDICULAR"} & snap_elements:
+                    vertices = mesh.vertices
+                    for edge in mesh.edges:
+                        p1 = matrix @ vertices[edge.vertices[0]].co
+                        p2 = matrix @ vertices[edge.vertices[1]].co
+                        if "EDGE_MIDPOINT" in snap_elements:
+                            point = (p1 + p2) * 0.5
+                            dist_sq = _screen_distance_sq(region, rv3d, point, coord)
+                        else:
+                            point, dist_sq = _closest_screen_point_on_segment(region, rv3d, p1, p2, coord)
+                        if dist_sq is not None and dist_sq < best_dist_sq:
+                            best_point = point
+                            best_dist_sq = dist_sq
+            finally:
+                eval_obj.to_mesh_clear()
+
+    if best_point is not None:
+        return best_point
+
+    ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+    ray_direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+    hit, location, _normal, _index, obj, _matrix = context.scene.ray_cast(
+        context.evaluated_depsgraph_get(),
+        ray_origin,
+        ray_direction,
+    )
+    if hit and obj is not None and obj.type == "MESH":
+        if snap_enabled and "FACE" not in snap_elements:
+            return None
+        return location
+
+    return None
 
 
 def _point_camera_xy(camera: bpy.types.Object, point: Vector) -> tuple[float, float]:
