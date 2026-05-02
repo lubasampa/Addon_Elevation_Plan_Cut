@@ -26,7 +26,12 @@ from mathutils.geometry import intersect_line_plane
 
 _DRAW_HANDLE_VIEW = None
 _DRAW_HANDLE_TEXT = None
-_DRAW_DIMENSION_PREVIEW = {"active": False, "p1": None, "p2": None, "label": ""}
+_DRAW_DIMENSION_PREVIEW = {
+    "active": False,
+    "segments": [],
+    "label_pos": None,
+    "label": "",
+}
 
 
 def _safe_name(name: str) -> str:
@@ -457,6 +462,144 @@ def _format_length(scene, length: float) -> str:
     return f"{length:.3f}"
 
 
+def _camera_axes(camera: bpy.types.Object):
+    quat = camera.matrix_world.to_quaternion()
+    right = quat @ Vector((1.0, 0.0, 0.0))
+    up = quat @ Vector((0.0, 1.0, 0.0))
+    forward = quat @ Vector((0.0, 0.0, -1.0))
+    return right.normalized(), up.normalized(), forward.normalized()
+
+
+def _camera_cut_depth(settings) -> float:
+    return max(0.0, min(float(settings.depth_near), float(settings.depth_far)))
+
+
+def _camera_cut_plane_point(camera: bpy.types.Object, settings) -> Vector:
+    _right, _up, forward = _camera_axes(camera)
+    return camera.matrix_world.translation + (forward * _camera_cut_depth(settings))
+
+
+def _project_world_to_camera_cut_plane(point: Vector, camera: bpy.types.Object, settings) -> Vector:
+    right, up, _forward = _camera_axes(camera)
+    plane_origin = _camera_cut_plane_point(camera, settings)
+    offset = point - plane_origin
+    return plane_origin + (right * offset.dot(right)) + (up * offset.dot(up))
+
+
+def _constrain_dimension_point(p1: Vector, p2: Vector, mode: str, camera: bpy.types.Object) -> Vector:
+    if mode not in {"HORIZONTAL", "VERTICAL"}:
+        return p2
+
+    right, up, _forward = _camera_axes(camera)
+    delta = p2 - p1
+    if mode == "HORIZONTAL":
+        return p1 + (right * delta.dot(right))
+    return p1 + (up * delta.dot(up))
+
+
+def _mouse_to_camera_cut_plane(context: bpy.types.Context, event, camera: bpy.types.Object, settings):
+    region = context.region
+    if context.area is not None:
+        window_regions = [reg for reg in context.area.regions if reg.type == "WINDOW"]
+        if window_regions:
+            region = window_regions[0]
+    rv3d = context.region_data
+    if region is None or rv3d is None:
+        return None
+
+    coord = (event.mouse_x - region.x, event.mouse_y - region.y)
+    ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+    ray_direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+    plane_point = _camera_cut_plane_point(camera, settings)
+    _right, _up, plane_normal = _camera_axes(camera)
+    hit = intersect_line_plane(ray_origin, ray_origin + ray_direction, plane_point, plane_normal)
+    if hit is None:
+        return None
+    return hit
+
+
+def _point_camera_xy(camera: bpy.types.Object, point: Vector) -> tuple[float, float]:
+    local = camera.matrix_world.inverted() @ point
+    return local.x, local.y
+
+
+def _world_from_camera_xy(camera: bpy.types.Object, settings, x: float, y: float) -> Vector:
+    depth = _camera_cut_depth(settings)
+    return camera.matrix_world @ Vector((x, y, -depth))
+
+
+def _circle_from_3_points_2d(a, b, c):
+    ax, ay = a
+    bx, by = b
+    cx, cy = c
+    d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(d) <= 1e-9:
+        return None
+
+    aa = ax * ax + ay * ay
+    bb = bx * bx + by * by
+    cc = cx * cx + cy * cy
+    ux = (aa * (by - cy) + bb * (cy - ay) + cc * (ay - by)) / d
+    uy = (aa * (cx - bx) + bb * (ax - cx) + cc * (bx - ax)) / d
+    radius = math.dist((ux, uy), a)
+    if radius <= 1e-9:
+        return None
+    return (ux, uy), radius
+
+
+def _angle_delta_ccw(start: float, end: float) -> float:
+    return (end - start) % (math.pi * 2.0)
+
+
+def _arc_camera_points(camera: bpy.types.Object, settings, p1: Vector, p2: Vector, p3: Vector, steps: int = 32):
+    a = _point_camera_xy(camera, p1)
+    b = _point_camera_xy(camera, p2)
+    c = _point_camera_xy(camera, p3)
+    circle = _circle_from_3_points_2d(a, b, c)
+    if circle is None:
+        return [p1, p3], (p1 + p3) * 0.5, (p3 - p1).length
+
+    center, radius = circle
+    start = math.atan2(a[1] - center[1], a[0] - center[0])
+    mid = math.atan2(b[1] - center[1], b[0] - center[0])
+    end = math.atan2(c[1] - center[1], c[0] - center[0])
+    ccw_total = _angle_delta_ccw(start, end)
+    ccw_mid = _angle_delta_ccw(start, mid)
+    if ccw_mid <= ccw_total:
+        total = ccw_total
+    else:
+        total = -_angle_delta_ccw(end, start)
+
+    count = max(8, int(steps))
+    points = []
+    for index in range(count + 1):
+        angle = start + (total * (index / count))
+        x = center[0] + math.cos(angle) * radius
+        y = center[1] + math.sin(angle) * radius
+        points.append(_world_from_camera_xy(camera, settings, x, y))
+
+    label_angle = start + (total * 0.5)
+    label_pos = _world_from_camera_xy(
+        camera,
+        settings,
+        center[0] + math.cos(label_angle) * radius,
+        center[1] + math.sin(label_angle) * radius,
+    )
+    return points, label_pos, abs(total) * radius
+
+
+def _segments_from_points(points):
+    return [(points[index], points[index + 1]) for index in range(len(points) - 1)]
+
+
+def _clear_dimension_preview():
+    _DRAW_DIMENSION_PREVIEW["active"] = False
+    _DRAW_DIMENSION_PREVIEW["segments"] = []
+    _DRAW_DIMENSION_PREVIEW["label_pos"] = None
+    _DRAW_DIMENSION_PREVIEW["label"] = ""
+    _tag_redraw_view3d()
+
+
 def _angle_radians(p1: Vector, pivot: Vector, p3: Vector):
     v1 = p1 - pivot
     v2 = p3 - pivot
@@ -862,8 +1005,17 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
         if ann.annotation_type == "TEXT":
             depth = _camera_depth(p1_cam)
             if dmin <= depth <= dmax:
-                if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, p1_world, budget=budget, accel=accel):
-                    world_texts.append((p1_world, ann.text.strip() or ann.name or "Note"))
+                world_texts.append((p1_world, ann.text.strip() or ann.name or "Note"))
+            continue
+
+        if ann.annotation_type == "ARC":
+            p2_world = Vector(ann.p2)
+            p3_world = Vector(ann.p3)
+            arc_points, label_pos, arc_length = _arc_camera_points(camera, settings, p1_world, p2_world, p3_world)
+            for w1, w2 in _segments_from_points(arc_points):
+                world_lines.append((w1, w2))
+            label = ann.text.strip() or _format_length(scene, arc_length)
+            world_texts.append((label_pos, label))
             continue
 
         if ann.annotation_type == "ANGLE":
@@ -884,8 +1036,6 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
                 c2_world = pivot_world.lerp(p1_world if clipped is clipped1 else p3_world, t1)
 
                 vis_parts = [(0.0, 1.0)]
-                if settings.visible_only:
-                    vis_parts = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget, accel=accel)
 
                 for s0, s1 in vis_parts:
                     v1_world = c1_world.lerp(c2_world, s0)
@@ -899,8 +1049,7 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
                 label_pos = _angle_label_position(p1_world, pivot_world, p3_world)
                 depth = _camera_depth(cam_inv @ label_pos)
                 if dmin <= depth <= dmax:
-                    if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, label_pos, budget=budget, accel=accel):
-                        world_texts.append((label_pos, label))
+                    world_texts.append((label_pos, label))
             continue
 
         p2_world = Vector(ann.p2)
@@ -914,8 +1063,6 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
         c2_world = p1_world.lerp(p2_world, t1)
 
         vis_parts = [(0.0, 1.0)]
-        if settings.visible_only:
-            vis_parts = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget, accel=accel)
 
         any_line = False
         for s0, s1 in vis_parts:
@@ -928,8 +1075,7 @@ def _collect_annotation_world_geometry(scene, depsgraph, camera, settings, dmin:
         if any_line:
             label = ann.text.strip() or _format_length(scene, (c2_world - c1_world).length)
             mid_world = (c1_world + c2_world) * 0.5
-            if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, mid_world, budget=budget, accel=accel):
-                world_texts.append((mid_world, label))
+            world_texts.append((mid_world, label))
 
     if progress is not None:
         progress(1.0, "Annotations ready")
@@ -1154,8 +1300,9 @@ def _draw_annotations_overlay_view():
     for w1, w2 in world_lines:
         line_vertices.extend((w1, w2))
 
-    if _DRAW_DIMENSION_PREVIEW["active"] and _DRAW_DIMENSION_PREVIEW["p1"] and _DRAW_DIMENSION_PREVIEW["p2"]:
-        line_vertices.extend((_DRAW_DIMENSION_PREVIEW["p1"], _DRAW_DIMENSION_PREVIEW["p2"]))
+    if _DRAW_DIMENSION_PREVIEW["active"]:
+        for p1, p2 in _DRAW_DIMENSION_PREVIEW["segments"]:
+            line_vertices.extend((p1, p2))
 
     if not line_vertices:
         return
@@ -1203,9 +1350,8 @@ def _draw_annotations_overlay_text():
             blf.position(font_id, p2d.x + 4.0, p2d.y + 4.0, 0)
             blf.draw(font_id, txt)
 
-    if _DRAW_DIMENSION_PREVIEW["active"] and _DRAW_DIMENSION_PREVIEW["p1"] and _DRAW_DIMENSION_PREVIEW["p2"]:
-        mid = (_DRAW_DIMENSION_PREVIEW["p1"] + _DRAW_DIMENSION_PREVIEW["p2"]) * 0.5
-        p2d = view3d_utils.location_3d_to_region_2d(context.region, context.region_data, mid)
+    if _DRAW_DIMENSION_PREVIEW["active"] and _DRAW_DIMENSION_PREVIEW["label_pos"]:
+        p2d = view3d_utils.location_3d_to_region_2d(context.region, context.region_data, _DRAW_DIMENSION_PREVIEW["label_pos"])
         if p2d:
             blf.position(font_id, p2d.x + 4.0, p2d.y + 4.0, 0)
             blf.draw(font_id, _DRAW_DIMENSION_PREVIEW["label"])
@@ -1392,7 +1538,16 @@ def _get_angle_points_from_context(context: bpy.types.Context):
 
 
 class MESHCUT_PG_annotation(PropertyGroup):
-    annotation_type: EnumProperty(name="Type", items=[("TEXT", "Text", "Text note"), ("DIMENSION", "Dimension", "Distance dimension"), ("ANGLE", "Angle", "Angle dimension with 3 points")], default="TEXT")
+    annotation_type: EnumProperty(
+        name="Type",
+        items=[
+            ("TEXT", "Text", "Text note"),
+            ("DIMENSION", "Dimension", "Distance dimension"),
+            ("ANGLE", "Angle", "Angle dimension with 3 points"),
+            ("ARC", "Arc", "Arc length dimension with 3 points"),
+        ],
+        default="TEXT",
+    )
     text: StringProperty(name="Text", default="")
     p1: FloatVectorProperty(name="P1", size=3, subtype="TRANSLATION", default=(0.0, 0.0, 0.0))
     p2: FloatVectorProperty(name="P2", size=3, subtype="TRANSLATION", default=(0.0, 0.0, 0.0))
@@ -1432,6 +1587,18 @@ class MESHCUT_PG_settings(PropertyGroup):
     dxf_text_height: FloatProperty(name="DXF Text Height", description="Text height in DXF units", default=0.2, min=0.0001, soft_max=1000.0)
     new_text_label: StringProperty(name="New Text", description="Text used for new note", default="Note")
     new_dim_label: StringProperty(name="Dimension Label", description="Custom label for new dimensions (empty = auto length)", default="")
+    dimension_mode: EnumProperty(
+        name="Measure Mode",
+        description="Constraint used by the viewport measure tool",
+        items=[
+            ("LINEAR", "Linear", "Measure a straight 2-point distance"),
+            ("ALIGNED", "Aligned", "Measure the direct distance between two points"),
+            ("HORIZONTAL", "Horizontal", "Measure only along the camera horizontal axis"),
+            ("VERTICAL", "Vertical", "Measure only along the camera vertical axis"),
+            ("ARC", "Arc", "Measure an arc from three clicked points"),
+        ],
+        default="LINEAR",
+    )
     dimension_default_length: FloatProperty(name="Dimension Length", description="Default length when creating a new dimension object", default=1.0, min=0.001, soft_max=1000.0)
     annotation_on_top: BoolProperty(name="Annotations On Top", description="Draw annotation lines over geometry in viewport", default=True, update=_update_redraw)
     annotation_line_color: FloatVectorProperty(name="Annotation Line Color", description="Line color for annotation preview and export", subtype="COLOR", size=4, min=0.0, max=1.0, default=(1.0, 0.85, 0.1, 0.95), update=_update_redraw)
@@ -1449,6 +1616,8 @@ class MESHCUT_UL_annotations(UIList):
             icon = "DRIVER_DISTANCE"
         elif item.annotation_type == "ANGLE":
             icon = "DRIVER_ROTATIONAL_DIFFERENCE"
+        elif item.annotation_type == "ARC":
+            icon = "MOD_CURVE"
         layout.label(text=(item.text if item.text else item.name), icon=icon)
 
 
@@ -1485,9 +1654,15 @@ class MESHCUT_OT_add_dimension_annotation(Operator):
     def execute(self, context):
         scene = context.scene
         settings = scene.meshcut_settings
+        camera = settings.camera_obj or scene.camera
         cursor = scene.cursor.location.copy()
-        p1 = cursor
-        p2 = cursor + Vector((settings.dimension_default_length, 0.0, 0.0))
+        if camera and camera.type == "CAMERA":
+            right, _up, _forward = _camera_axes(camera)
+            p1 = _project_world_to_camera_cut_plane(cursor, camera, settings)
+            p2 = p1 + (right * settings.dimension_default_length)
+        else:
+            p1 = cursor
+            p2 = cursor + Vector((settings.dimension_default_length, 0.0, 0.0))
 
         ann = scene.meshcut_annotations.add()
         ann.annotation_type = "DIMENSION"
@@ -1504,6 +1679,134 @@ class MESHCUT_OT_add_dimension_annotation(Operator):
         scene.meshcut_annotation_index = len(scene.meshcut_annotations) - 1
         self.report({"INFO"}, "Dimension object created. Move A/B empties to set endpoints.")
         return {"FINISHED"}
+
+
+class MESHCUT_OT_measure_dimension(Operator):
+    bl_idname = "meshcut.measure_dimension"
+    bl_label = "Measure In Viewport"
+    bl_description = "Click in the viewport to create a 2D camera-aligned measurement on the selected cut plane"
+    bl_options = {"REGISTER", "UNDO"}
+
+    dimension_mode: EnumProperty(
+        name="Mode",
+        items=[
+            ("LINEAR", "Linear", "Measure a straight 2-point distance"),
+            ("ALIGNED", "Aligned", "Measure the direct distance between two points"),
+            ("HORIZONTAL", "Horizontal", "Constrain the second point to the camera horizontal axis"),
+            ("VERTICAL", "Vertical", "Constrain the second point to the camera vertical axis"),
+            ("ARC", "Arc", "Click start, point on arc, and end"),
+        ],
+        default="LINEAR",
+    )
+
+    def _camera(self, context):
+        settings = context.scene.meshcut_settings
+        return settings.camera_obj or context.scene.camera
+
+    def _required_points(self):
+        return 3 if self.dimension_mode == "ARC" else 2
+
+    def _current_points(self):
+        if self._hover is None:
+            return list(self._points)
+        points = list(self._points) + [self._hover]
+        if self.dimension_mode in {"HORIZONTAL", "VERTICAL"} and len(points) >= 2:
+            points[1] = _constrain_dimension_point(points[0], points[1], self.dimension_mode, self._camera_obj)
+        return points
+
+    def _update_preview(self, context):
+        points = self._current_points()
+        settings = context.scene.meshcut_settings
+        scene = context.scene
+        segments = []
+        label_pos = None
+        label = ""
+
+        if self.dimension_mode == "ARC" and len(points) >= 2:
+            if len(points) >= 3:
+                arc_points, label_pos, arc_length = _arc_camera_points(self._camera_obj, settings, points[0], points[1], points[2])
+                segments = _segments_from_points(arc_points)
+                label = _format_length(scene, arc_length)
+            else:
+                segments = [(points[0], points[1])]
+                label_pos = (points[0] + points[1]) * 0.5
+                label = _format_length(scene, (points[1] - points[0]).length)
+        elif len(points) >= 2:
+            p1, p2 = points[0], points[1]
+            segments = [(p1, p2)]
+            label_pos = (p1 + p2) * 0.5
+            label = _format_length(scene, (p2 - p1).length)
+
+        _DRAW_DIMENSION_PREVIEW["active"] = bool(segments)
+        _DRAW_DIMENSION_PREVIEW["segments"] = segments
+        _DRAW_DIMENSION_PREVIEW["label_pos"] = label_pos
+        _DRAW_DIMENSION_PREVIEW["label"] = label
+        _tag_redraw_view3d()
+
+    def _finish(self, context):
+        points = self._current_points()[: self._required_points()]
+        if len(points) < self._required_points():
+            _clear_dimension_preview()
+            return {"CANCELLED"}
+
+        scene = context.scene
+        settings = scene.meshcut_settings
+        ann = scene.meshcut_annotations.add()
+        ann.annotation_type = "ARC" if self.dimension_mode == "ARC" else "DIMENSION"
+        ann.text = settings.new_dim_label.strip()
+        ann.name = f"{'Arc' if self.dimension_mode == 'ARC' else 'Dim'} {len(scene.meshcut_annotations)}"
+        ann.p1 = points[0]
+        ann.p2 = points[1]
+        ann.p3 = points[2] if self.dimension_mode == "ARC" else points[1]
+        ann.p1_object_name = ""
+        ann.p2_object_name = ""
+        ann.p3_object_name = ""
+        scene.meshcut_annotation_index = len(scene.meshcut_annotations) - 1
+        _clear_dimension_preview()
+        self.report({"INFO"}, "2D camera-aligned measurement created.")
+        return {"FINISHED"}
+
+    def modal(self, context, event):
+        if event.type in {"ESC", "RIGHTMOUSE"}:
+            _clear_dimension_preview()
+            return {"CANCELLED"}
+
+        if event.type == "MOUSEMOVE":
+            self._hover = _mouse_to_camera_cut_plane(context, event, self._camera_obj, context.scene.meshcut_settings)
+            self._update_preview(context)
+            return {"RUNNING_MODAL"}
+
+        if event.type == "LEFTMOUSE" and event.value == "PRESS":
+            point = _mouse_to_camera_cut_plane(context, event, self._camera_obj, context.scene.meshcut_settings)
+            if point is None:
+                return {"RUNNING_MODAL"}
+            self._hover = point
+            current = self._current_points()
+            self._points.append(current[-1])
+            if len(self._points) >= self._required_points():
+                return self._finish(context)
+            self._hover = None
+            self._update_preview(context)
+            return {"RUNNING_MODAL"}
+
+        return {"RUNNING_MODAL"}
+
+    def invoke(self, context, event):
+        if context.area is None or context.area.type != "VIEW_3D":
+            self.report({"ERROR"}, "Run the measure tool from a 3D Viewport.")
+            return {"CANCELLED"}
+
+        camera = self._camera(context)
+        if not camera or camera.type != "CAMERA":
+            self.report({"ERROR"}, "Pick a valid camera in Mesh Cut > Camera.")
+            return {"CANCELLED"}
+
+        self._camera_obj = camera
+        self._points = []
+        self._hover = _mouse_to_camera_cut_plane(context, event, camera, context.scene.meshcut_settings)
+        context.window_manager.modal_handler_add(self)
+        self._update_preview(context)
+        return {"RUNNING_MODAL"}
 
 
 class MESHCUT_OT_add_angle_annotation(Operator):
@@ -1784,6 +2087,9 @@ class MESHCUT_PT_panel(Panel):
         col.prop(settings, "new_text_label")
         col.operator("meshcut.add_text_annotation", icon="FONT_DATA")
         col.prop(settings, "new_dim_label")
+        col.prop(settings, "dimension_mode")
+        op = col.operator("meshcut.measure_dimension", text="Measure In Viewport", icon="EMPTY_ARROWS")
+        op.dimension_mode = settings.dimension_mode
         col.prop(settings, "dimension_default_length")
         col.operator("meshcut.add_dimension_annotation", icon="DRIVER_DISTANCE")
         col.operator("meshcut.add_angle_annotation", icon="DRIVER_ROTATIONAL_DIFFERENCE")
@@ -1808,6 +2114,7 @@ classes = (
     MESHCUT_UL_annotations,
     MESHCUT_OT_add_text_annotation,
     MESHCUT_OT_add_dimension_annotation,
+    MESHCUT_OT_measure_dimension,
     MESHCUT_OT_add_angle_annotation,
     MESHCUT_OT_remove_annotation,
     MESHCUT_OT_clear_annotations,

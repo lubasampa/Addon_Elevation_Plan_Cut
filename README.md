@@ -64,6 +64,13 @@ The Depth Filter panel also controls section output:
 - `Hatch Spacing`: distance between hatch lines.
 - `Hatch Angle`: hatch direction in degrees.
 
+The Annotations panel includes a viewport measurement tool:
+
+- `Measure Mode`: creates linear, aligned, horizontal, vertical, or 3-point arc measurements.
+- `Measure In Viewport`: click directly in the 3D Viewport to place a 2D camera-aligned measurement.
+
+Viewport measurements are stored on the selected camera cut plane (`Depth Near`/`Depth Far` minimum) and are projected as 2D annotation geometry for preview plus SVG/DXF export.
+
 ## DXF Layers
 
 DXF export now writes entities to layers derived from object class names:
