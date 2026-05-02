@@ -77,7 +77,7 @@ The Export panel supports vector and viewport-shaded output:
 
 - `Export SVG`: writes projected linework and annotations.
 - `Export DXF`: writes layered CAD linework and annotations.
-- `Export Camera View PNG`: writes the configured camera view using Blender's current OpenGL/viewport shading.
+- `Export Camera View PNG`: writes the configured camera view using Blender's current OpenGL/viewport shading, including viewport annotation overlays.
 
 ## DXF Layers
 

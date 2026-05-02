@@ -145,6 +145,25 @@ def _tag_redraw_all_areas() -> None:
             area.tag_redraw()
 
 
+def _find_view3d_context(context: bpy.types.Context):
+    area = context.area if getattr(context, "area", None) and context.area.type == "VIEW_3D" else None
+    region = None
+    space = None
+
+    if area is None:
+        screen = getattr(context, "screen", None)
+        if screen is None and getattr(context, "window", None) is not None:
+            screen = context.window.screen
+        if screen is not None:
+            area = next((candidate for candidate in screen.areas if candidate.type == "VIEW_3D"), None)
+
+    if area is not None:
+        region = next((candidate for candidate in area.regions if candidate.type == "WINDOW"), None)
+        space = next((candidate for candidate in area.spaces if candidate.type == "VIEW_3D"), None)
+
+    return area, region, space
+
+
 class _ProgressReporter:
     def __init__(self, context: bpy.types.Context, label: str):
         self._context = context
@@ -2303,13 +2322,26 @@ class MESHCUT_OT_export_viewport_image(Operator):
         old_filepath = scene.render.filepath
         old_format = scene.render.image_settings.file_format
         old_extension = scene.render.use_file_extension
+        old_show_annotation_preview = settings.show_annotation_preview
+        area, region, space = _find_view3d_context(context)
+        if area is None or region is None or space is None:
+            self.report({"ERROR"}, "Open a 3D Viewport to export camera view overlays.")
+            return {"CANCELLED"}
+
+        old_overlay_state = space.overlay.show_overlays
+        old_region_perspective = getattr(space.region_3d, "view_perspective", None) if space.region_3d else None
 
         try:
             scene.camera = camera
             scene.render.filepath = filepath
             scene.render.image_settings.file_format = "PNG"
             scene.render.use_file_extension = True
-            bpy.ops.render.opengl(write_still=True, view_context=False)
+            settings.show_annotation_preview = True
+            space.overlay.show_overlays = True
+            with context.temp_override(area=area, region=region, space_data=space, region_data=space.region_3d):
+                bpy.ops.view3d.view_camera()
+                _tag_redraw_view3d()
+                bpy.ops.render.opengl(write_still=True, view_context=True)
             self.report({"INFO"}, f"Camera view PNG exported: {filepath}")
             return {"FINISHED"}
         except Exception as exc:
@@ -2320,6 +2352,10 @@ class MESHCUT_OT_export_viewport_image(Operator):
             scene.render.filepath = old_filepath
             scene.render.image_settings.file_format = old_format
             scene.render.use_file_extension = old_extension
+            settings.show_annotation_preview = old_show_annotation_preview
+            space.overlay.show_overlays = old_overlay_state
+            if old_region_perspective is not None and space.region_3d is not None:
+                space.region_3d.view_perspective = old_region_perspective
 
     def invoke(self, context, _event):
         if not self.filepath:
