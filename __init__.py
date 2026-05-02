@@ -451,6 +451,90 @@ def _draw_depth_overlay():
     gpu.state.blend_set("NONE")
 
 
+def _draw_dynamic_cut_overlay():
+    context = bpy.context
+    if not context or not context.scene:
+        return
+
+    scene = context.scene
+    settings = getattr(scene, "meshcut_settings", None)
+    if settings is None or not settings.show_dynamic_cut_preview:
+        return
+
+    camera = settings.camera_obj or scene.camera
+    if not camera or camera.type != "CAMERA":
+        return
+    if not _is_preview_camera_context(context, camera):
+        return
+
+    view_layer = context.view_layer
+    depsgraph = context.evaluated_depsgraph_get()
+    if settings.use_selected_only:
+        mesh_objects = [obj for obj in view_layer.objects if obj.type == "MESH" and obj.select_get(view_layer=view_layer)]
+    else:
+        mesh_objects = [obj for obj in view_layer.objects if obj.type == "MESH" and obj.visible_get(view_layer=view_layer)]
+
+    if not mesh_objects:
+        return
+
+    dmin = max(0.0, min(settings.depth_near, settings.depth_far))
+    dmax = max(settings.depth_near, settings.depth_far)
+    depths = [dmin]
+    if not math.isclose(dmin, dmax):
+        depths.append(dmax)
+
+    cam_inv = camera.matrix_world.inverted()
+    near_lines = []
+    far_lines = []
+
+    for obj in mesh_objects:
+        eval_obj = obj.evaluated_get(depsgraph)
+        mesh = eval_obj.to_mesh()
+        if mesh is None:
+            continue
+
+        try:
+            mesh.calc_loop_triangles()
+            world_mat = eval_obj.matrix_world
+            world_verts = [world_mat @ vertex.co for vertex in mesh.vertices]
+            cam_verts = [cam_inv @ point for point in world_verts]
+
+            for depth_index, cut_depth in enumerate(depths):
+                target = near_lines if depth_index == 0 else far_lines
+                for tri in mesh.loop_triangles:
+                    tri_indices = tri.vertices
+                    world_tri = [world_verts[index] for index in tri_indices]
+                    cam_tri = [cam_verts[index] for index in tri_indices]
+                    section = _triangle_section_segment(world_tri, cam_tri, cut_depth)
+                    if section is None:
+                        continue
+                    p1, p2 = section
+                    if (p2 - p1).length > 1e-8:
+                        target.extend((p1, p2))
+        finally:
+            eval_obj.to_mesh_clear()
+
+    if not near_lines and not far_lines:
+        return
+
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    gpu.state.blend_set("ALPHA")
+    gpu.state.depth_test_set("LESS_EQUAL")
+    gpu.state.line_width_set(max(1.0, float(settings.dynamic_cut_line_width)))
+
+    shader.bind()
+    if near_lines:
+        shader.uniform_float("color", settings.dynamic_near_cut_color)
+        batch_for_shader(shader, "LINES", {"pos": near_lines}).draw(shader)
+    if far_lines:
+        shader.uniform_float("color", settings.dynamic_far_cut_color)
+        batch_for_shader(shader, "LINES", {"pos": far_lines}).draw(shader)
+
+    gpu.state.line_width_set(1.0)
+    gpu.state.depth_test_set("NONE")
+    gpu.state.blend_set("NONE")
+
+
 def _format_length(scene, length: float) -> str:
     unit = scene.unit_settings.length_unit
     if unit in {"MILLIMETERS", "MILLIMETRES"}:
@@ -1474,6 +1558,7 @@ def _draw_annotations_overlay_text():
 
 def _draw_view_overlay():
     _draw_depth_overlay()
+    _draw_dynamic_cut_overlay()
     _draw_annotations_overlay_view()
 
 def _bounds_2d(segments, points, anno_lines, anno_texts):
@@ -1690,6 +1775,10 @@ class MESHCUT_PG_settings(PropertyGroup):
         soft_max=512,
     )
     show_depth_overlay: BoolProperty(name="Show Near/Far Overlay", description="Draw depth range box in viewport", default=True, update=_update_redraw)
+    show_dynamic_cut_preview: BoolProperty(name="Show Dynamic Cuts", description="Draw live mesh intersections at Depth Near and Depth Far", default=True, update=_update_redraw)
+    dynamic_cut_line_width: FloatProperty(name="Cut Line Width", description="Viewport line width for dynamic cut preview", default=2.0, min=1.0, max=8.0, update=_update_redraw)
+    dynamic_near_cut_color: FloatVectorProperty(name="Near Cut Color", description="Viewport color for the Depth Near cut", subtype="COLOR", size=4, min=0.0, max=1.0, default=(0.0, 1.0, 0.25, 1.0), update=_update_redraw)
+    dynamic_far_cut_color: FloatVectorProperty(name="Far Cut Color", description="Viewport color for the Depth Far cut", subtype="COLOR", size=4, min=0.0, max=1.0, default=(1.0, 0.45, 0.0, 1.0), update=_update_redraw)
     depth_near: FloatProperty(name="Depth Near", description="Minimum depth from camera", default=0.0, min=0.0, soft_max=1000.0, update=_update_redraw)
     depth_far: FloatProperty(name="Depth Far", description="Maximum depth from camera", default=100.0, min=0.0, soft_max=1000.0, update=_update_redraw)
     export_section_cuts: BoolProperty(name="Export Cut Edges", description="Create real section lines where mesh faces cross the near cut plane", default=True)
@@ -2141,6 +2230,58 @@ class MESHCUT_OT_export_dxf(Operator):
         return {"RUNNING_MODAL"}
 
 
+class MESHCUT_OT_export_viewport_image(Operator):
+    bl_idname = "meshcut.export_viewport_image"
+    bl_label = "Export Camera View PNG"
+    bl_description = "Export the configured camera view using Blender's current viewport/OpenGL shading"
+    bl_options = {"REGISTER"}
+
+    filepath: StringProperty(subtype="FILE_PATH")
+    filename_ext = ".png"
+    filter_glob: StringProperty(default="*.png", options={"HIDDEN"})
+
+    def execute(self, context):
+        scene = (getattr(context, "scene", None) or bpy.context.scene)
+        settings = scene.meshcut_settings
+        camera = settings.camera_obj or scene.camera
+        if not camera or camera.type != "CAMERA":
+            self.report({"ERROR"}, "Pick a valid camera in Mesh Cut > Camera.")
+            return {"CANCELLED"}
+
+        filepath = self.filepath
+        if not filepath.lower().endswith(".png"):
+            filepath = f"{filepath}.png"
+
+        old_camera = scene.camera
+        old_filepath = scene.render.filepath
+        old_format = scene.render.image_settings.file_format
+        old_extension = scene.render.use_file_extension
+
+        try:
+            scene.camera = camera
+            scene.render.filepath = filepath
+            scene.render.image_settings.file_format = "PNG"
+            scene.render.use_file_extension = True
+            bpy.ops.render.opengl(write_still=True, view_context=False)
+            self.report({"INFO"}, f"Camera view PNG exported: {filepath}")
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        finally:
+            scene.camera = old_camera
+            scene.render.filepath = old_filepath
+            scene.render.image_settings.file_format = old_format
+            scene.render.use_file_extension = old_extension
+
+    def invoke(self, context, _event):
+        if not self.filepath:
+            blend_name = Path(bpy.data.filepath).stem or "untitled"
+            self.filepath = str(Path.home() / f"{_safe_name(blend_name)}_camera_view.png")
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+
 class MESHCUT_PT_panel(Panel):
     bl_label = "Mesh Cut Plan/Elevation"
     bl_idname = "MESHCUT_PT_panel"
@@ -2167,6 +2308,11 @@ class MESHCUT_PT_panel(Panel):
 
         col.separator(); col.label(text="Depth Filter")
         col.prop(settings, "show_depth_overlay")
+        col.prop(settings, "show_dynamic_cut_preview")
+        if settings.show_dynamic_cut_preview:
+            col.prop(settings, "dynamic_cut_line_width")
+            col.prop(settings, "dynamic_near_cut_color")
+            col.prop(settings, "dynamic_far_cut_color")
         col.prop(settings, "depth_near")
         col.prop(settings, "depth_far")
         col.prop(settings, "export_section_cuts")
@@ -2221,6 +2367,7 @@ class MESHCUT_PT_panel(Panel):
         col.prop(settings, "dxf_text_height")
         col.operator("meshcut.export_svg", icon="EXPORT")
         col.operator("meshcut.export_dxf", icon="EXPORT")
+        col.operator("meshcut.export_viewport_image", icon="RENDER_RESULT")
 
 
 classes = (
@@ -2236,6 +2383,7 @@ classes = (
     MESHCUT_OT_create_camera,
     MESHCUT_OT_export_svg,
     MESHCUT_OT_export_dxf,
+    MESHCUT_OT_export_viewport_image,
     MESHCUT_PT_panel,
 )
 

@@ -59,6 +59,7 @@ The Visibility panel exposes the key runtime controls:
 
 The Depth Filter panel also controls section output:
 
+- `Show Dynamic Cuts`: draws live mesh intersections at `Depth Near` and `Depth Far` in the viewport.
 - `Export Cut Edges`: creates real section lines from mesh faces crossing the near cut plane instead of relying only on existing mesh edges.
 - `Export Cut Hatches`: creates hatch linework inside closed section contours.
 - `Hatch Spacing`: distance between hatch lines.
@@ -70,6 +71,12 @@ The Annotations panel includes a viewport measurement tool:
 - `Measure In Viewport`: click directly in the 3D Viewport to place a 2D camera-aligned measurement.
 
 Viewport measurements are stored on the selected camera cut plane (`Depth Near`/`Depth Far` minimum) and are projected as 2D annotation geometry for preview plus SVG/DXF export.
+
+The Export panel supports vector and viewport-shaded output:
+
+- `Export SVG`: writes projected linework and annotations.
+- `Export DXF`: writes layered CAD linework and annotations.
+- `Export Camera View PNG`: writes the configured camera view using Blender's current OpenGL/viewport shading.
 
 ## DXF Layers
 
