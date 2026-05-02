@@ -86,7 +86,52 @@ def _tag_redraw_view3d() -> None:
                 area.tag_redraw()
 
 
+def _camera_clip_values_from_settings(settings):
+    start = max(0.001, min(float(settings.depth_near), float(settings.depth_far)))
+    end = max(float(settings.depth_near), float(settings.depth_far), start + 0.001)
+    if end <= start:
+        end = start + 0.001
+    return start, end
+
+
+def _restore_camera_clip(camera: bpy.types.Object) -> None:
+    if not camera or camera.type != "CAMERA":
+        return
+
+    cam_data = camera.data
+    if "_meshcut_clip_start" in cam_data:
+        cam_data.clip_start = float(cam_data["_meshcut_clip_start"])
+        del cam_data["_meshcut_clip_start"]
+    if "_meshcut_clip_end" in cam_data:
+        cam_data.clip_end = float(cam_data["_meshcut_clip_end"])
+        del cam_data["_meshcut_clip_end"]
+
+
+def _sync_dynamic_camera_clip(settings, camera: bpy.types.Object) -> None:
+    if not camera or camera.type != "CAMERA":
+        return
+
+    if not getattr(settings, "show_dynamic_cut_preview", False) or not getattr(settings, "clip_dynamic_cut_view", False):
+        _restore_camera_clip(camera)
+        return
+
+    cam_data = camera.data
+    if "_meshcut_clip_start" not in cam_data:
+        cam_data["_meshcut_clip_start"] = cam_data.clip_start
+    if "_meshcut_clip_end" not in cam_data:
+        cam_data["_meshcut_clip_end"] = cam_data.clip_end
+
+    clip_start, clip_end = _camera_clip_values_from_settings(settings)
+    cam_data.clip_start = clip_start
+    cam_data.clip_end = clip_end
+
+
 def _update_redraw(_self=None, _context=None):
+    context = _context or bpy.context
+    scene = getattr(context, "scene", None)
+    settings = getattr(scene, "meshcut_settings", None) if scene is not None else None
+    if settings is not None:
+        _sync_dynamic_camera_clip(settings, settings.camera_obj or scene.camera)
     _tag_redraw_view3d()
 
 
@@ -466,6 +511,7 @@ def _draw_dynamic_cut_overlay():
         return
     if not _is_preview_camera_context(context, camera):
         return
+    _sync_dynamic_camera_clip(settings, camera)
 
     view_layer = context.view_layer
     depsgraph = context.evaluated_depsgraph_get()
@@ -1776,6 +1822,7 @@ class MESHCUT_PG_settings(PropertyGroup):
     )
     show_depth_overlay: BoolProperty(name="Show Near/Far Overlay", description="Draw depth range box in viewport", default=True, update=_update_redraw)
     show_dynamic_cut_preview: BoolProperty(name="Show Dynamic Cuts", description="Draw live mesh intersections at Depth Near and Depth Far", default=True, update=_update_redraw)
+    clip_dynamic_cut_view: BoolProperty(name="Clip View To Depth Range", description="Hide geometry outside Depth Near and Depth Far by syncing the camera clipping range", default=True, update=_update_redraw)
     dynamic_cut_line_width: FloatProperty(name="Cut Line Width", description="Viewport line width for dynamic cut preview", default=2.0, min=1.0, max=8.0, update=_update_redraw)
     dynamic_near_cut_color: FloatVectorProperty(name="Near Cut Color", description="Viewport color for the Depth Near cut", subtype="COLOR", size=4, min=0.0, max=1.0, default=(0.0, 1.0, 0.25, 1.0), update=_update_redraw)
     dynamic_far_cut_color: FloatVectorProperty(name="Far Cut Color", description="Viewport color for the Depth Far cut", subtype="COLOR", size=4, min=0.0, max=1.0, default=(1.0, 0.45, 0.0, 1.0), update=_update_redraw)
@@ -2310,6 +2357,7 @@ class MESHCUT_PT_panel(Panel):
         col.prop(settings, "show_depth_overlay")
         col.prop(settings, "show_dynamic_cut_preview")
         if settings.show_dynamic_cut_preview:
+            col.prop(settings, "clip_dynamic_cut_view")
             col.prop(settings, "dynamic_cut_line_width")
             col.prop(settings, "dynamic_near_cut_color")
             col.prop(settings, "dynamic_far_cut_color")

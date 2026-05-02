@@ -60,6 +60,7 @@ The Visibility panel exposes the key runtime controls:
 The Depth Filter panel also controls section output:
 
 - `Show Dynamic Cuts`: draws live mesh intersections at `Depth Near` and `Depth Far` in the viewport.
+- `Clip View To Depth Range`: hides viewport/camera geometry outside `Depth Near` and `Depth Far` while dynamic cuts are enabled.
 - `Export Cut Edges`: creates real section lines from mesh faces crossing the near cut plane instead of relying only on existing mesh edges.
 - `Export Cut Hatches`: creates hatch linework inside closed section contours.
 - `Hatch Spacing`: distance between hatch lines.
