@@ -350,7 +350,54 @@ def _ray_from_camera(camera, point_world: Vector, epsilon: float = 1e-4):
     return origin, direction, dist
 
 
-def _is_world_point_visible(scene, depsgraph, camera, point_world: Vector, epsilon: float = 1e-4, budget=None, accel=None) -> bool:
+def _camera_depth_world(camera, point_world: Vector) -> float:
+    return _camera_depth(camera.matrix_world.inverted() @ point_world)
+
+
+def _visibility_mask_depth_clipped(scene, depsgraph, accel, origins, directions, distances, camera, min_depth: float, epsilon: float = 1e-4):
+    if min_depth <= epsilon:
+        return visibility_mask(scene, accel, origins, directions, distances, epsilon=epsilon)
+
+    visible = []
+    bvh = accel.bvh if accel else None
+    for origin, direction, dist in zip(origins, directions, distances):
+        remaining_origin = origin
+        remaining_dist = dist
+        ray_visible = True
+
+        for _ in range(64):
+            if remaining_dist <= epsilon:
+                break
+
+            if bvh is not None:
+                hit_loc, _normal, _index, _distance = bvh.ray_cast(remaining_origin, direction, remaining_dist + epsilon)
+                hit = hit_loc is not None
+                location = hit_loc
+            else:
+                hit, location, _normal, _index, _obj, _matrix = scene.ray_cast(depsgraph, remaining_origin, direction, distance=remaining_dist + epsilon)
+
+            if not hit:
+                break
+
+            hit_offset = (location - remaining_origin).length
+            total_hit_dist = dist - remaining_dist + hit_offset
+            if total_hit_dist >= dist - epsilon:
+                break
+
+            if _camera_depth_world(camera, location) >= min_depth - epsilon:
+                ray_visible = False
+                break
+
+            step = max(epsilon * 10.0, hit_offset + (epsilon * 10.0))
+            remaining_origin = remaining_origin + (direction * step)
+            remaining_dist = max(0.0, dist - (remaining_origin - origin).length)
+
+        visible.append(ray_visible)
+
+    return visible
+
+
+def _is_world_point_visible(scene, depsgraph, camera, point_world: Vector, min_depth: float = 0.0, epsilon: float = 1e-4, budget=None, accel=None) -> bool:
     ray_data = _ray_from_camera(camera, point_world, epsilon=epsilon)
     if ray_data is None:
         return True
@@ -360,18 +407,20 @@ def _is_world_point_visible(scene, depsgraph, camera, point_world: Vector, epsil
         return _budget_returns_visible(budget)
 
     origin, direction, dist = ray_data
-    return visibility_mask(
+    return _visibility_mask_depth_clipped(
         scene,
+        depsgraph,
         accel,
         [origin],
         [direction],
         [dist],
+        camera,
+        min_depth,
         epsilon=epsilon,
-        require_cython=bool(budget and budget.get("require_cython")),
     )[0]
 
 
-def _visible_intervals_on_segment(scene, depsgraph, camera, p1_world: Vector, p2_world: Vector, samples: int, budget=None, accel=None):
+def _visible_intervals_on_segment(scene, depsgraph, camera, p1_world: Vector, p2_world: Vector, samples: int, min_depth: float = 0.0, budget=None, accel=None):
     if budget and budget["enabled"] and budget["limit_hit"]:
         return [(0.0, 1.0)] if _budget_returns_visible(budget) else []
 
@@ -402,13 +451,15 @@ def _visible_intervals_on_segment(scene, depsgraph, camera, p1_world: Vector, p2
         distances.append(dist)
 
     if origins:
-        batched_visibility = visibility_mask(
+        batched_visibility = _visibility_mask_depth_clipped(
             scene,
+            depsgraph,
             accel,
             origins,
             directions,
             distances,
-            require_cython=bool(budget and budget.get("require_cython")),
+            camera,
+            min_depth,
         )
         for idx, visible in zip(batched_indices, batched_visibility):
             vis_flags[idx] = visible
@@ -1469,7 +1520,7 @@ def _collect_segments(context: bpy.types.Context, progress=None):
                 for vertex_index, (p_cam, p_world) in enumerate(zip(cam_verts, world_verts), start=1):
                     depth = _camera_depth(p_cam)
                     if dmin <= depth <= dmax:
-                        if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, p_world, budget=budget, accel=accel):
+                        if (not settings.visible_only) or _is_world_point_visible(scene, depsgraph, camera, p_world, min_depth=dmin, budget=budget, accel=accel):
                             points.append(_make_point(_project_point(camera, p_cam), projection_layer))
                     if (vertex_index % 512) == 0:
                         _update_mesh_progress(f"Tracing vertices: {obj.name}", local_done=vertex_index)
@@ -1495,7 +1546,7 @@ def _collect_segments(context: bpy.types.Context, progress=None):
                     segments.append(_make_line(_project_point(camera, c1_cam), _project_point(camera, c2_cam), projection_layer, kind="PROJECTION"))
                     continue
 
-                intervals = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, budget=budget, accel=accel)
+                intervals = _visible_intervals_on_segment(scene, depsgraph, camera, c1_world, c2_world, settings.visibility_samples, min_depth=dmin, budget=budget, accel=accel)
                 for s0, s1 in intervals:
                     v1_cam = c1_cam.lerp(c2_cam, s0)
                     v2_cam = c1_cam.lerp(c2_cam, s1)
